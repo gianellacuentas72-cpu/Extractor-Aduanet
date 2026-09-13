@@ -21,9 +21,16 @@ def descargar_exportaciones_hibrido(fecha_inicio, fecha_fin, ruc):
     opciones.add_argument("--headless")
     opciones.add_argument("--no-sandbox")
     opciones.add_argument("--disable-dev-shm-usage")
+    opciones.add_argument("--disable-gpu") # Recomendado para estabilidad en Linux
     opciones.add_argument("user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64)")
 
-    servicio = Service(ChromeDriverManager().install())
+    # 1. Le indicamos la ruta exacta del navegador Chromium en Linux
+    opciones.binary_location = "/usr/bin/chromium"
+    
+    # 2. Le indicamos la ruta del driver que instalamos por packages.txt
+    servicio = Service("/usr/bin/chromedriver")
+    
+    # 3. Iniciamos el navegador con estas rutas fijas
     driver = webdriver.Chrome(service=servicio, options=opciones)
 
     url_busqueda = f"http://www.aduanet.gob.pe/cl-ad-consdespade/ConsExportIAServlet?accion=infDeta&FecInicial={fecha_inicio}&FecFinal={fecha_fin}&codseleccion=exportador&dato={ruc}&flagBusq=1&pTipoConsulta=infDeta"
