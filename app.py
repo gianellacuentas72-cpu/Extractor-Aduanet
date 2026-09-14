@@ -43,8 +43,9 @@ def _extraer_mejor_tabla(html):
 
 
 @st.cache_data(show_spinner=False)
-def _descargar_bloque(fecha_inicio, fecha_fin, ruc):
-    """Descarga un rango de fechas asumiendo que cabe dentro de UNA sola sesión (pocos registros)."""
+def _descargar_bloque(fecha_inicio, fecha_fin, ruc, intento_global=0):
+    """Descarga un rango de fechas asumiendo que cabe dentro de UNA sola sesión (pocos registros).
+    intento_global no se usa en la lógica, solo sirve para invalidar la caché en los reintentos."""
     opciones = Options()
     opciones.add_argument("--headless")
     opciones.add_argument("--no-sandbox")
@@ -139,7 +140,7 @@ def descargar_exportaciones_periodo(fecha_inicio, fecha_fin, ruc, umbral=UMBRAL_
     fecha_inicio / fecha_fin: strings "dd/mm/aaaa"
     """
     sangria = "  " * profundidad
-    df_bloque, total = _descargar_bloque(fecha_inicio, fecha_fin, ruc)
+    df_bloque, total = _descargar_bloque(fecha_inicio, fecha_fin, ruc, 0)
 
     dt_ini = datetime.strptime(fecha_inicio, "%d/%m/%Y")
     dt_fin = datetime.strptime(fecha_fin, "%d/%m/%Y")
@@ -156,7 +157,17 @@ def descargar_exportaciones_periodo(fecha_inicio, fecha_fin, ruc, umbral=UMBRAL_
         df2 = descargar_exportaciones_periodo(f_medio_ini, fecha_fin, ruc, umbral, profundidad + 1)
         return pd.concat([df1, df2], ignore_index=True)
     else:
-        st.write(f"{sangria}✅ {fecha_inicio}-{fecha_fin}: esperados {total}, obtenidos {len(df_bloque)}")
+        # Bloque final (hoja): si viene incompleto más allá de un margen chico de ruido,
+        # reintentar el bloque COMPLETO desde cero (nueva sesión de Selenium).
+        tolerancia = max(2, math.ceil(total * 0.02)) if total > 0 else 0
+        intento = 0
+        while total > 0 and len(df_bloque) < total - tolerancia and intento < 2:
+            intento += 1
+            st.write(f"{sangria}🔁 {fecha_inicio}-{fecha_fin} incompleto ({len(df_bloque)}/{total}), reintentando bloque completo (intento {intento})...")
+            df_bloque, total = _descargar_bloque(fecha_inicio, fecha_fin, ruc, intento)
+
+        estado = "✅" if total == 0 or len(df_bloque) >= total - tolerancia else "❗"
+        st.write(f"{sangria}{estado} {fecha_inicio}-{fecha_fin}: esperados {total}, obtenidos {len(df_bloque)}")
         return df_bloque
 
 
