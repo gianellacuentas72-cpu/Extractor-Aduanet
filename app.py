@@ -48,14 +48,12 @@ def descargar_exportaciones_hibrido(fecha_inicio, fecha_fin, ruc):
     total_registros = int(match_total.group(1))
     total_paginas = math.ceil(total_registros / 20)
 
-    # CORRECCIÓN DE EXTRACCIÓN: Usamos t.size para garantizar la captura de la tabla de 22 columnas
-    tablas_pagina1 = pd.read_html(StringIO(html_pagina1))
-    todas_las_tablas = [max(tablas_pagina1, key=lambda t: t.size)]
-
+    # SOLUCIÓN: Lista vacía. Obligamos a requests a descargar desde la PÁGINA 1
+    todas_las_tablas = []
     url_paginacion = "http://www.aduanet.gob.pe/cl-ad-consdespade/FrmPolizaporDetalle.jsp"
     
-    # Continuamos con requests desde la página 2
-    for pagina in range(2, total_paginas + 1):
+    # El rango ahora empieza en 1
+    for pagina in range(1, total_paginas + 1):
         resp_pag = sesion.post(url_paginacion, data={"tamanioPagina": "20", "pagina": str(pagina)})
         resp_pag.encoding = "ISO-8859-1"
         try:
@@ -90,7 +88,7 @@ def descargar_exportaciones_hibrido(fecha_inicio, fecha_fin, ruc):
 ruc_input = st.text_input("RUC de la empresa:", value="20451899881")
 col1, col2 = st.columns(2)
 with col1: fecha_input_inicio = st.text_input("Fecha Inicio (DDMMAAAA):", value="01012026")
-with col2: fecha_input_fin = st.text_input("Fecha Fin (DDMMAAAA):", value="30092026")
+with col2: fecha_input_fin = st.text_input("Fecha Fin (DDMMAAAA):", value="31012026")
 
 if st.button("🚀 Extraer Datos", type="primary"):
     try:
