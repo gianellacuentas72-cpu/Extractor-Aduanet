@@ -4,19 +4,47 @@ import math
 import re
 from io import BytesIO, StringIO
 import time
+from datetime import datetime, timedelta
+import calendar
 from selenium import webdriver
 from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.chrome.options import Options
 from webdriver_manager.chrome import ChromeDriverManager
 import requests
-from datetime import datetime
-import calendar
 
 st.set_page_config(page_title="Extractor Sunat - Prolan", page_icon="📊", layout="centered")
 st.title("📊 Extractor Automático de Exportaciones")
 
+UMBRAL_REGISTROS = 150  # por encima de esto, se parte el rango de fechas en dos y se reintenta cada mitad
+
+
+def _contar_duas(t):
+    if t is None:
+        return 0
+    return int(t.iloc[:, 0].astype(str).str.contains(r'\d{3}-\d{4}-\d+', regex=True).sum() +
+                t.iloc[:, 1].astype(str).str.contains(r'\d{3}-\d{4}-\d+', regex=True).sum())
+
+
+def _extraer_mejor_tabla(html):
+    try:
+        tablas = pd.read_html(StringIO(html))
+    except ValueError:
+        return None
+    best_t, max_duas = None, -1
+    for t in tablas:
+        if t.shape[1] >= 15:
+            duas = _contar_duas(t)
+            if duas > max_duas:
+                max_duas = duas
+                best_t = t.copy()
+    if best_t is not None:
+        best_t.columns = range(best_t.shape[1])
+    return best_t
+
+
 @st.cache_data(show_spinner=False)
-def descargar_exportaciones_hibrido(fecha_inicio, fecha_fin, ruc):
+def _descargar_bloque(fecha_inicio, fecha_fin, ruc):
+    """Descarga un rango de fechas asumiendo que cabe dentro de UNA sola sesión (pocos registros)."""
     opciones = Options()
     opciones.add_argument("--headless")
     opciones.add_argument("--no-sandbox")
@@ -38,36 +66,13 @@ def descargar_exportaciones_hibrido(fecha_inicio, fecha_fin, ruc):
 
     match_total = re.search(r"a\s+\d+\s+de\s+(\d+)", html_inicial)
     if not match_total:
-        return pd.DataFrame()
+        return pd.DataFrame(), 0
     total_registros = int(match_total.group(1))
 
-    def contar_duas(t):
-        """Cuenta cuántas filas de una tabla parecen ser declaraciones reales (patrón NNN-AAAA-NNNNNN)."""
-        if t is None:
-            return 0
-        return int(t.iloc[:, 0].astype(str).str.contains(r'\d{3}-\d{4}-\d+', regex=True).sum() +
-                    t.iloc[:, 1].astype(str).str.contains(r'\d{3}-\d{4}-\d+', regex=True).sum())
-
-    def extraer_mejor_tabla(html):
-        try:
-            tablas = pd.read_html(StringIO(html))
-        except ValueError:
-            return None
-        best_t, max_duas = None, -1
-        for t in tablas:
-            if t.shape[1] >= 15:
-                duas = contar_duas(t)
-                if duas > max_duas:
-                    max_duas = duas
-                    best_t = t.copy()
-        if best_t is not None:
-            best_t.columns = range(best_t.shape[1])
-        return best_t
-
-    tabla_inicial = extraer_mejor_tabla(html_inicial)
+    tabla_inicial = _extraer_mejor_tabla(html_inicial)
     todas_las_tablas = []
 
-    if tabla_inicial is not None and contar_duas(tabla_inicial) >= total_registros * 0.9:
+    if tabla_inicial is not None and _contar_duas(tabla_inicial) >= total_registros * 0.9:
         todas_las_tablas.append(tabla_inicial)
     else:
         sesion = requests.Session()
@@ -75,49 +80,32 @@ def descargar_exportaciones_hibrido(fecha_inicio, fecha_fin, ruc):
             sesion.cookies.set(cookie['name'], cookie['value'])
         sesion.headers.update({"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)", "Referer": url_busqueda})
 
-        TAMANIO_PAGINA = 100  # antes 20 -- probando bloques más grandes para evitar el corte en "página 14"
-        total_paginas = math.ceil(total_registros / TAMANIO_PAGINA)
+        total_paginas = math.ceil(total_registros / 20)
         url_paginacion = "http://www.aduanet.gob.pe/cl-ad-consdespade/FrmPolizaporDetalle.jsp"
 
         for pagina in range(1, total_paginas + 1):
-            # Cuántas DUAs reales esperamos en esta página (la última puede traer menos)
-            if pagina < total_paginas:
-                esperadas = TAMANIO_PAGINA
-            else:
-                esperadas = total_registros - TAMANIO_PAGINA * (total_paginas - 1)
+            esperadas = 20 if pagina < total_paginas else total_registros - 20 * (total_paginas - 1)
+            mejor_intento, mejor_duas = None, -1
 
-            mejor_intento = None
-            mejor_duas = -1
-            intentos = 3
-
-            for intento in range(1, intentos + 1):
-                resp_pag = sesion.post(url_paginacion, data={"tamanioPagina": str(TAMANIO_PAGINA), "pagina": str(pagina)})
+            for intento in range(1, 4):
+                resp_pag = sesion.post(url_paginacion, data={"tamanioPagina": "20", "pagina": str(pagina)})
                 resp_pag.encoding = "ISO-8859-1"
-                t = extraer_mejor_tabla(resp_pag.text)
-                duas_obtenidas = contar_duas(t)
-
+                t = _extraer_mejor_tabla(resp_pag.text)
+                duas_obtenidas = _contar_duas(t)
                 if duas_obtenidas > mejor_duas:
-                    mejor_duas = duas_obtenidas
-                    mejor_intento = t
-
+                    mejor_duas, mejor_intento = duas_obtenidas, t
                 if duas_obtenidas >= esperadas:
-                    break  # ya llegó completa, no hace falta reintentar
-
-                # Si vino incompleta, esperar más antes de reintentar (posible corte de sesión)
+                    break
                 time.sleep(2 * intento)
-
-            st.write(f"Página {pagina}/{total_paginas}: {mejor_duas}/{esperadas} DUAs (tras {intento} intento(s))")
 
             if mejor_intento is not None:
                 todas_las_tablas.append(mejor_intento)
-
             time.sleep(1.5)
 
     if not todas_las_tablas:
-        return pd.DataFrame()
+        return pd.DataFrame(), total_registros
 
     df_final = pd.concat(todas_las_tablas, ignore_index=True)
-
     df_final[0] = df_final[0].replace([None, 'nan', 'NaN', ''], pd.NA).ffill()
     df_final[1] = df_final[1].replace([None, 'nan', 'NaN', ''], pd.NA).ffill()
 
@@ -134,10 +122,37 @@ def descargar_exportaciones_hibrido(fecha_inicio, fecha_fin, ruc):
         df_final['FOB'] = pd.to_numeric(df_final['FOB'], errors='coerce')
 
     df_final = df_final.drop_duplicates(ignore_index=True)
+    return df_final, total_registros
 
-    st.write(f"[DIAGNÓSTICO] Total esperado: {total_registros} | Total obtenido tras limpieza: {len(df_final)}")
 
-    return df_final
+def descargar_exportaciones_periodo(fecha_inicio, fecha_fin, ruc, umbral=UMBRAL_REGISTROS, profundidad=0):
+    """
+    Descarga un rango de fechas dado, partiéndolo automáticamente en dos mitades
+    (recursivo) cuando tiene demasiados registros para caber en una sola sesión.
+    fecha_inicio / fecha_fin: strings "dd/mm/aaaa"
+    """
+    sangria = "  " * profundidad
+    df_bloque, total = _descargar_bloque(fecha_inicio, fecha_fin, ruc)
+
+    dt_ini = datetime.strptime(fecha_inicio, "%d/%m/%Y")
+    dt_fin = datetime.strptime(fecha_fin, "%d/%m/%Y")
+
+    if total > umbral and dt_fin > dt_ini:
+        # Demasiados registros para una sola sesión: partir el rango en dos mitades
+        dias_totales = (dt_fin - dt_ini).days
+        dt_medio = dt_ini + timedelta(days=dias_totales // 2)
+        f_medio_fin = dt_medio.strftime("%d/%m/%Y")
+        f_medio_ini = (dt_medio + timedelta(days=1)).strftime("%d/%m/%Y")
+
+        st.write(f"{sangria}⚠️ {fecha_inicio}-{fecha_fin} tiene {total} registros (> {umbral}), dividiendo en dos...")
+        df1 = descargar_exportaciones_periodo(fecha_inicio, f_medio_fin, ruc, umbral, profundidad + 1)
+        df2 = descargar_exportaciones_periodo(f_medio_ini, fecha_fin, ruc, umbral, profundidad + 1)
+        return pd.concat([df1, df2], ignore_index=True)
+    else:
+        st.write(f"{sangria}✅ {fecha_inicio}-{fecha_fin}: esperados {total}, obtenidos {len(df_bloque)}")
+        return df_bloque
+
+
 ruc_input = st.text_input("RUC de la empresa:", value="20451899881")
 col1, col2 = st.columns(2)
 with col1: fecha_input_inicio = st.text_input("Fecha Inicio (DDMMAAAA):", value="01012026")
@@ -161,7 +176,7 @@ if st.button("🚀 Extraer Datos", type="primary"):
                 f_fin = f"{dia_fin:02d}/{mes_actual:02d}/{año_actual}"
 
                 st.write(f"Consultando: {f_inicio} al {f_fin}")
-                df_mes = descargar_exportaciones_hibrido(f_inicio, f_fin, ruc_input)
+                df_mes = descargar_exportaciones_periodo(f_inicio, f_fin, ruc_input)
                 if not df_mes.empty: df_acumulado = pd.concat([df_acumulado, df_mes], ignore_index=True)
             status.update(label="¡Extracción completada!", state="complete")
 
