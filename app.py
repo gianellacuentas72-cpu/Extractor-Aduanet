@@ -40,7 +40,13 @@ def descargar_exportaciones_hibrido(fecha_inicio, fecha_fin, ruc):
     if not match_total:
         return pd.DataFrame()
     total_registros = int(match_total.group(1))
-    st.write(f"🔎 [1] Total según SUNAT (texto 'de N'): {total_registros}")
+
+    def contar_duas(t):
+        """Cuenta cuántas filas de una tabla parecen ser declaraciones reales (patrón NNN-AAAA-NNNNNN)."""
+        if t is None:
+            return 0
+        return int(t.iloc[:, 0].astype(str).str.contains(r'\d{3}-\d{4}-\d+', regex=True).sum() +
+                    t.iloc[:, 1].astype(str).str.contains(r'\d{3}-\d{4}-\d+', regex=True).sum())
 
     def extraer_mejor_tabla(html):
         try:
@@ -50,8 +56,7 @@ def descargar_exportaciones_hibrido(fecha_inicio, fecha_fin, ruc):
         best_t, max_duas = None, -1
         for t in tablas:
             if t.shape[1] >= 15:
-                duas = t.iloc[:, 0].astype(str).str.contains(r'\d{3}-\d{4}-\d+', regex=True).sum() + \
-                       t.iloc[:, 1].astype(str).str.contains(r'\d{3}-\d{4}-\d+', regex=True).sum()
+                duas = contar_duas(t)
                 if duas > max_duas:
                     max_duas = duas
                     best_t = t.copy()
@@ -60,15 +65,11 @@ def descargar_exportaciones_hibrido(fecha_inicio, fecha_fin, ruc):
         return best_t
 
     tabla_inicial = extraer_mejor_tabla(html_inicial)
-    st.write(f"🔎 [2] Filas en tabla_inicial (cruda, sin limpiar): {len(tabla_inicial) if tabla_inicial is not None else 'None'}")
-
     todas_las_tablas = []
 
-    if tabla_inicial is not None and len(tabla_inicial) >= total_registros * 0.9:
-        st.write("🔎 [3] Se usó la respuesta inicial directamente (SIN paginación)")
+    if tabla_inicial is not None and contar_duas(tabla_inicial) >= total_registros * 0.9:
         todas_las_tablas.append(tabla_inicial)
     else:
-        st.write("🔎 [3] Se activó el FALLBACK de paginación (FrmPolizaporDetalle.jsp)")
         sesion = requests.Session()
         for cookie in cookies_selenium:
             sesion.cookies.set(cookie['name'], cookie['value'])
@@ -78,30 +79,50 @@ def descargar_exportaciones_hibrido(fecha_inicio, fecha_fin, ruc):
         url_paginacion = "http://www.aduanet.gob.pe/cl-ad-consdespade/FrmPolizaporDetalle.jsp"
 
         for pagina in range(1, total_paginas + 1):
-            resp_pag = sesion.post(url_paginacion, data={"tamanioPagina": "20", "pagina": str(pagina)})
-            resp_pag.encoding = "ISO-8859-1"
-            t = extraer_mejor_tabla(resp_pag.text)
-            filas_pag = len(t) if t is not None else 0
-            st.write(f"    Página {pagina}/{total_paginas}: {filas_pag} filas")
-            if t is not None:
-                todas_las_tablas.append(t)
-            time.sleep(1)
+            # Cuántas DUAs reales esperamos en esta página (la última puede traer menos de 20)
+            if pagina < total_paginas:
+                esperadas = 20
+            else:
+                esperadas = total_registros - 20 * (total_paginas - 1)
+
+            mejor_intento = None
+            mejor_duas = -1
+            intentos = 3
+
+            for intento in range(1, intentos + 1):
+                resp_pag = sesion.post(url_paginacion, data={"tamanioPagina": "20", "pagina": str(pagina)})
+                resp_pag.encoding = "ISO-8859-1"
+                t = extraer_mejor_tabla(resp_pag.text)
+                duas_obtenidas = contar_duas(t)
+
+                if duas_obtenidas > mejor_duas:
+                    mejor_duas = duas_obtenidas
+                    mejor_intento = t
+
+                if duas_obtenidas >= esperadas:
+                    break  # ya llegó completa, no hace falta reintentar
+
+                # Si vino incompleta, esperar más antes de reintentar (posible corte de sesión)
+                time.sleep(2 * intento)
+
+            st.write(f"Página {pagina}/{total_paginas}: {mejor_duas}/{esperadas} DUAs (tras {intento} intento(s))")
+
+            if mejor_intento is not None:
+                todas_las_tablas.append(mejor_intento)
+
+            time.sleep(1.5)
 
     if not todas_las_tablas:
         return pd.DataFrame()
 
     df_final = pd.concat(todas_las_tablas, ignore_index=True)
-    st.write(f"🔎 [4] Filas tras concatenar todas las tablas: {len(df_final)}")
 
     df_final[0] = df_final[0].replace([None, 'nan', 'NaN', ''], pd.NA).ffill()
     df_final[1] = df_final[1].replace([None, 'nan', 'NaN', ''], pd.NA).ffill()
-    st.write(f"🔎 [5] Filas tras ffill (no debería cambiar la cantidad): {len(df_final)}")
 
     if df_final.shape[1] >= 12:
         mask_serie = pd.to_numeric(df_final[11], errors='coerce').notna()
-        filas_descartadas = (~mask_serie).sum()
         df_final = df_final[mask_serie].reset_index(drop=True)
-        st.write(f"🔎 [6] Filtro SERIE (columna 11) descartó {filas_descartadas} filas -> quedan {len(df_final)}")
 
     cols = ['DESCLARACION', 'EXPORTADOR', 'FEC.NUM', 'AGENTE', "CANT SERIE'S", 'FOB TOT.', 'ALMACEN', 'AFORO', 'NETO TOT', '# BULTOS', 'PAIS DEST', 'SERIE', 'PARTIDA', 'DESC. COMER', 'DESC. PREST', 'DESC. MAT. CONST', 'DES. USO', 'DESC. OTROS', 'CANT', 'UNID.', 'PESO NETO', 'FOB']
     df_final = df_final.iloc[:, :22]
@@ -111,12 +132,11 @@ def descargar_exportaciones_hibrido(fecha_inicio, fecha_fin, ruc):
         df_final['FOB'] = df_final['FOB'].astype(str).str.replace(',', '', regex=False).str.strip()
         df_final['FOB'] = pd.to_numeric(df_final['FOB'], errors='coerce')
 
-    antes_dedup = len(df_final)
     df_final = df_final.drop_duplicates(ignore_index=True)
-    st.write(f"🔎 [7] drop_duplicates eliminó {antes_dedup - len(df_final)} filas -> total final: {len(df_final)}")
+
+    st.write(f"[DIAGNÓSTICO] Total esperado: {total_registros} | Total obtenido tras limpieza: {len(df_final)}")
 
     return df_final
-
 ruc_input = st.text_input("RUC de la empresa:", value="20451899881")
 col1, col2 = st.columns(2)
 with col1: fecha_input_inicio = st.text_input("Fecha Inicio (DDMMAAAA):", value="01012026")
