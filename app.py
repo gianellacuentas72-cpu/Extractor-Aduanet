@@ -15,6 +15,33 @@ import calendar
 st.set_page_config(page_title="Extractor Sunat - Prolan", page_icon="📊", layout="centered")
 st.title("📊 Extractor Automático de Exportaciones")
 
+# --- EL ALGORITMO INTELIGENTE PARA TABLAS ANIDADAS ---
+def extraer_tabla_correcta(html_source):
+    try:
+        tablas = pd.read_html(StringIO(html_source))
+        candidatas = []
+        for t in tablas:
+            if t.shape[1] >= 15:
+                # Estandarizamos los nombres de columnas a números (0, 1, 2...)
+                t.columns = range(t.shape[1])
+                # Contamos cuántas filas válidas (DUA) tiene esta tabla
+                mask = t[0].astype(str).str.contains(r'\d{3}-\d{4}-\d+', regex=True) | \
+                       t[1].astype(str).str.contains(r'\d{3}-\d{4}-\d+', regex=True)
+                filas_validas = mask.sum()
+                
+                if filas_validas > 0:
+                    # Guardamos: (Cantidad_DUAS, Total_Filas, DataFrame)
+                    candidatas.append((filas_validas, t.shape[0], t))
+        
+        if candidatas:
+            # MAGIA: Ordenamos priorizando MÁS filas válidas, y en caso de empate, MENOS filas totales (para descartar la tabla externa)
+            candidatas.sort(key=lambda x: (x[0], -x[1]), reverse=True)
+            return candidatas[0][2] # Retornamos solo la tabla perfecta
+    except Exception:
+        pass
+    return pd.DataFrame()
+
+
 @st.cache_data(show_spinner=False)
 def descargar_exportaciones_hibrido(fecha_inicio, fecha_fin, ruc):
     opciones = Options()
@@ -49,62 +76,49 @@ def descargar_exportaciones_hibrido(fecha_inicio, fecha_fin, ruc):
     total_registros = int(match_total.group(1))
     total_paginas = math.ceil(total_registros / 20)
 
-    # Juntamos los HTML
-    htmls = [html_pagina1]
+    todas_las_tablas = []
+    
+    # Extraemos Página 1
+    t1 = extraer_tabla_correcta(html_pagina1)
+    if not t1.empty:
+        todas_las_tablas.append(t1)
+
+    # Extraemos Páginas 2 en adelante
     url_paginacion = "http://www.aduanet.gob.pe/cl-ad-consdespade/FrmPolizaporDetalle.jsp"
     for pagina in range(2, total_paginas + 1):
         resp_pag = sesion.post(url_paginacion, data={"tamanioPagina": "20", "pagina": str(pagina)})
         resp_pag.encoding = "ISO-8859-1"
-        htmls.append(resp_pag.text)
+        t_pag = extraer_tabla_correcta(resp_pag.text)
+        if not t_pag.empty:
+            todas_las_tablas.append(t_pag)
         time.sleep(1)
-
-    todas_las_tablas = []
-    
-    # ATRAPAMOS TODAS LAS TABLAS PARA NO PERDER LOS 6 REGISTROS ROTOS
-    for html in htmls:
-        try:
-            tablas = pd.read_html(StringIO(html))
-            for t in tablas:
-                if t.shape[1] >= 15: 
-                    t.columns = range(t.shape[1]) 
-                    todas_las_tablas.append(t)
-        except ValueError:
-            continue
 
     if not todas_las_tablas: return pd.DataFrame()
 
     df_final = pd.concat(todas_las_tablas, ignore_index=True)
     
-    # --- LÓGICA DE LIMPIEZA MAESTRA ---
+    # --- LIMPIEZA FINAL ---
     col0 = df_final.columns[0]
     col1 = df_final.columns[1] if len(df_final.columns) > 1 else col0
     
-    # 1. Filtramos las filas reales (DUA)
+    # Nos quedamos estrictamente con las filas de datos
     mask = df_final[col0].astype(str).str.contains(r'\d{3}-\d{4}-\d+', regex=True) | \
            df_final[col1].astype(str).str.contains(r'\d{3}-\d{4}-\d+', regex=True)
            
     df_final = df_final[mask].reset_index(drop=True)
     
-    # 2. Formateamos las 22 columnas
+    # Formateamos las 22 columnas exactas
     cols = ['DESCLARACION', 'EXPORTADOR', 'FEC.NUM', 'AGENTE', "CANT SERIE'S", 'FOB TOT.', 'ALMACEN', 'AFORO', 'NETO TOT', '# BULTOS', 'PAIS DEST', 'SERIE', 'PARTIDA', 'DESC. COMER', 'DESC. PREST', 'DESC. MAT. CONST', 'DES. USO', 'DESC. OTROS', 'CANT', 'UNID.', 'PESO NETO', 'FOB']
     df_final = df_final.iloc[:, :len(cols)]
     df_final.columns = cols[:len(df_final.columns)]
     
-    # 3. EL BISTURÍ: Deduplicación por Llave Compuesta
-    # Limpiamos espacios para que la comparación sea perfecta
-    for c in ['DESCLARACION', 'SERIE', 'PESO NETO']:
-        if c in df_final.columns:
-            df_final[c] = df_final[c].astype(str).str.strip()
-            
-    # Borramos clones SOLAMENTE si coinciden en DUA + Serie + Peso Neto
-    df_final = df_final.drop_duplicates(subset=['DESCLARACION', 'SERIE', 'PESO NETO'], keep='first', ignore_index=True)
-    
-    # 4. Arreglamos los números
+    # Arreglamos los números
     if 'FOB' in df_final.columns:
         df_final['FOB'] = df_final['FOB'].astype(str).str.replace(',', '', regex=False).str.strip()
         df_final['FOB'] = pd.to_numeric(df_final['FOB'], errors='coerce')
         
     return df_final
+
 
 ruc_input = st.text_input("RUC de la empresa:", value="20451899881")
 col1, col2 = st.columns(2)
