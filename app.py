@@ -15,19 +15,6 @@ import calendar
 st.set_page_config(page_title="Extractor Sunat - Prolan", page_icon="📊", layout="centered")
 st.title("📊 Extractor Automático de Exportaciones")
 
-# --- NUEVA FUNCIÓN: Filtro estricto de tablas por columnas ---
-def extraer_tabla_datos(html_source):
-    try:
-        tablas = pd.read_html(StringIO(html_source))
-        # Filtramos estrictamente tablas con 15 columnas o más (la real tiene 22)
-        tablas_validas = [t for t in tablas if t.shape[1] >= 15]
-        if tablas_validas:
-            # Si encuentra más de una, tomamos la que tenga más filas de datos
-            return max(tablas_validas, key=lambda t: t.shape[0])
-    except Exception:
-        pass
-    return None
-
 @st.cache_data(show_spinner=False)
 def descargar_exportaciones_hibrido(fecha_inicio, fecha_fin, ruc):
     opciones = Options()
@@ -41,6 +28,7 @@ def descargar_exportaciones_hibrido(fecha_inicio, fecha_fin, ruc):
     servicio = Service("/usr/bin/chromedriver")
     driver = webdriver.Chrome(service=servicio, options=opciones)
 
+    # 1. Obtenemos la Página 1
     url_busqueda = f"http://www.aduanet.gob.pe/cl-ad-consdespade/ConsExportIAServlet?accion=infDeta&FecInicial={fecha_inicio}&FecFinal={fecha_fin}&codseleccion=exportador&dato={ruc}&flagBusq=1&pTipoConsulta=infDeta"
     driver.get(url_busqueda)
     time.sleep(3) 
@@ -61,35 +49,43 @@ def descargar_exportaciones_hibrido(fecha_inicio, fecha_fin, ruc):
     total_registros = int(match_total.group(1))
     total_paginas = math.ceil(total_registros / 20)
 
-    todas_las_tablas = []
-    
-    # 1. EXTRACCIÓN PÁGINA 1 (Infalible)
-    t1 = extraer_tabla_datos(html_pagina1)
-    if t1 is not None:
-        todas_las_tablas.append(t1)
-
-    # 2. EXTRACCIÓN PÁGINA 2 EN ADELANTE
+    # Consolidamos todos los HTMLs (Página 1 de Selenium + Páginas 2 en adelante de requests)
+    htmls = [html_pagina1]
     url_paginacion = "http://www.aduanet.gob.pe/cl-ad-consdespade/FrmPolizaporDetalle.jsp"
     for pagina in range(2, total_paginas + 1):
         resp_pag = sesion.post(url_paginacion, data={"tamanioPagina": "20", "pagina": str(pagina)})
         resp_pag.encoding = "ISO-8859-1"
-        t = extraer_tabla_datos(resp_pag.text)
-        if t is not None:
-            todas_las_tablas.append(t)
+        htmls.append(resp_pag.text)
         time.sleep(1)
+
+    todas_las_tablas = []
+    
+    # Extraemos la tabla más grande de CADA página de forma infalible
+    for html in htmls:
+        try:
+            tablas = pd.read_html(StringIO(html))
+            t = max(tablas, key=lambda x: x.size)
+            todas_las_tablas.append(t)
+        except ValueError:
+            continue
 
     if not todas_las_tablas: return pd.DataFrame()
 
     df_final = pd.concat(todas_las_tablas, ignore_index=True)
     
-    col = df_final.columns[0]
-    df_final[col] = df_final[col].astype(str)
+    # --- LÓGICA DE LIMPIEZA BLINDADA ---
+    # Buscamos el formato DUA (ej. 118-2026-000232) en las primeras columnas
+    col0 = df_final.columns[0]
+    col1 = df_final.columns[1] if len(df_final.columns) > 1 else col0
     
-    df_final = df_final[~df_final[col].str.lower().str.contains(r'declaracion|declara|exportador|fec\.num|fob|neto|informacion', na=False)]
-    df_final = df_final.dropna(how='all').reset_index(drop=True)
+    mask = df_final[col0].astype(str).str.contains(r'\d{3}-\d{4}-\d+', regex=True) | \
+           df_final[col1].astype(str).str.contains(r'\d{3}-\d{4}-\d+', regex=True)
+           
+    df_final = df_final[mask].reset_index(drop=True)
     
+    # Formateamos las 22 columnas exactas
     cols = ['DESCLARACION', 'EXPORTADOR', 'FEC.NUM', 'AGENTE', "CANT SERIE'S", 'FOB TOT.', 'ALMACEN', 'AFORO', 'NETO TOT', '# BULTOS', 'PAIS DEST', 'SERIE', 'PARTIDA', 'DESC. COMER', 'DESC. PREST', 'DESC. MAT. CONST', 'DES. USO', 'DESC. OTROS', 'CANT', 'UNID.', 'PESO NETO', 'FOB']
-    df_final = df_final.iloc[:, :len(cols)]
+    df_final = df_final.iloc[:, :22]
     df_final.columns = cols[:len(df_final.columns)]
     
     if 'FOB' in df_final.columns:
