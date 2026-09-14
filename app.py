@@ -28,83 +28,82 @@ def descargar_exportaciones_hibrido(fecha_inicio, fecha_fin, ruc):
     servicio = Service("/usr/bin/chromedriver")
     driver = webdriver.Chrome(service=servicio, options=opciones)
 
-    # 1. Selenium solo actúa como "Llave" para activar la sesión en el servidor
+    # 1. Usar Selenium SOLAMENTE como llave maestra para la sesión
     url_busqueda = f"http://www.aduanet.gob.pe/cl-ad-consdespade/ConsExportIAServlet?accion=infDeta&FecInicial={fecha_inicio}&FecFinal={fecha_fin}&codseleccion=exportador&dato={ruc}&flagBusq=1&pTipoConsulta=infDeta"
     driver.get(url_busqueda)
     time.sleep(3) 
     
-    # Robamos las cookies y cerramos el navegador fantasma
+    html_inicial = driver.page_source
     cookies_selenium = driver.get_cookies()
     driver.quit() 
     
-    # 2. Preparamos nuestro navegador rápido (Requests)
+    # 2. Trasladar sesión a Requests (El motor de descarga rápido)
     sesion = requests.Session()
     for cookie in cookies_selenium:
         sesion.cookies.set(cookie['name'], cookie['value'])
         
     sesion.headers.update({"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)", "Referer": url_busqueda})
-    
-    url_paginacion = "http://www.aduanet.gob.pe/cl-ad-consdespade/FrmPolizaporDetalle.jsp"
 
-    # --- LA MAGIA: Descargamos la Página 1 desde la URL interna real ---
-    resp_pag1 = sesion.get(url_paginacion)
-    resp_pag1.encoding = "ISO-8859-1"
-    html_pagina1 = resp_pag1.text
-
-    match_total = re.search(r"a\s+\d+\s+de\s+(\d+)", html_pagina1)
+    match_total = re.search(r"a\s+\d+\s+de\s+(\d+)", html_inicial)
     if not match_total: return pd.DataFrame()
         
     total_registros = int(match_total.group(1))
     total_paginas = math.ceil(total_registros / 20)
 
-    htmls = [html_pagina1]
-    
-    # Descargamos de la Página 2 en adelante
-    for pagina in range(2, total_paginas + 1):
-        resp_pag = sesion.post(url_paginacion, data={"tamanioPagina": "20", "pagina": str(pagina)})
-        resp_pag.encoding = "ISO-8859-1"
-        htmls.append(resp_pag.text)
-        time.sleep(1)
-
+    url_paginacion = "http://www.aduanet.gob.pe/cl-ad-consdespade/FrmPolizaporDetalle.jsp"
     todas_las_tablas = []
     
-    # Extraemos todas las tablas de todas las páginas de forma homogénea
-    for html in htmls:
+    # 3. EXTRAER DESDE LA PÁGINA 1 (Para no perder los 20 registros iniciales)
+    for pagina in range(1, total_paginas + 1):
+        resp_pag = sesion.post(url_paginacion, data={"tamanioPagina": "20", "pagina": str(pagina)})
+        resp_pag.encoding = "ISO-8859-1"
+        
         try:
-            tablas = pd.read_html(StringIO(html))
+            tablas = pd.read_html(StringIO(resp_pag.text))
+            best_t = None
+            max_duas = -1
+            
+            # Aislar la tabla interna correcta (Evita los 530 clones)
             for t in tablas:
                 if t.shape[1] >= 15: 
-                    t.columns = range(t.shape[1]) 
-                    todas_las_tablas.append(t)
+                    duas = t.iloc[:, 0].astype(str).str.contains(r'\d{3}-\d{4}-\d+', regex=True).sum() + \
+                           t.iloc[:, 1].astype(str).str.contains(r'\d{3}-\d{4}-\d+', regex=True).sum()
+                    
+                    if duas > max_duas:
+                        max_duas = duas
+                        best_t = t.copy()
+                        
+            if best_t is not None:
+                best_t.columns = range(best_t.shape[1]) 
+                todas_las_tablas.append(best_t)
         except ValueError:
             continue
+        time.sleep(1)
 
     if not todas_las_tablas: return pd.DataFrame()
 
     df_final = pd.concat(todas_las_tablas, ignore_index=True)
     
-    # --- LIMPIEZA MAESTRA ---
-    # 1. Matamos los clones generados por las tablas anidadas
-    df_final = df_final.astype(str).drop_duplicates(ignore_index=True)
+    # --- LIMPIEZA FINAL QUIRÚRGICA ---
+    # Rescatar filas con celdas combinadas arrastrando la DUA hacia abajo (Resuelve los 6 registros faltantes)
+    df_final[0] = df_final[0].replace([None, 'nan', 'NaN', ''], pd.NA).ffill()
+    df_final[1] = df_final[1].replace([None, 'nan', 'NaN', ''], pd.NA).ffill()
     
-    # 2. Conservamos solo filas donde la columna SERIE (11) tenga un número válido
+    # El Filtro de Oro: Conservar SOLO las filas donde el ítem (SERIE) sea un número real
     if df_final.shape[1] >= 12:
-        mask_serie = pd.to_numeric(df_final.iloc[:, 11], errors='coerce').notna()
+        mask_serie = pd.to_numeric(df_final[11], errors='coerce').notna()
         df_final = df_final[mask_serie].reset_index(drop=True)
-        
-        # 3. Rescatamos los 6 registros: Rellenamos las celdas combinadas de DUA hacia abajo
-        df_final.iloc[:, 0] = df_final.iloc[:, 0].replace(['nan', 'NaN', 'None', ''], pd.NA).ffill()
-        df_final.iloc[:, 1] = df_final.iloc[:, 1].replace(['nan', 'NaN', 'None', ''], pd.NA).ffill()
 
-    # Formateamos las 22 columnas exactas
     cols = ['DESCLARACION', 'EXPORTADOR', 'FEC.NUM', 'AGENTE', "CANT SERIE'S", 'FOB TOT.', 'ALMACEN', 'AFORO', 'NETO TOT', '# BULTOS', 'PAIS DEST', 'SERIE', 'PARTIDA', 'DESC. COMER', 'DESC. PREST', 'DESC. MAT. CONST', 'DES. USO', 'DESC. OTROS', 'CANT', 'UNID.', 'PESO NETO', 'FOB']
-    df_final = df_final.iloc[:, :len(cols)]
+    df_final = df_final.iloc[:, :22]
     df_final.columns = cols[:len(df_final.columns)]
     
-    # Convertimos FOB a número calculable
     if 'FOB' in df_final.columns:
         df_final['FOB'] = df_final['FOB'].astype(str).str.replace(',', '', regex=False).str.strip()
         df_final['FOB'] = pd.to_numeric(df_final['FOB'], errors='coerce')
+        
+    # Eliminación por si la SUNAT devuelve la misma página dos veces por error de sesión
+    df_final = df_final.drop_duplicates(ignore_index=True)
         
     return df_final
 
