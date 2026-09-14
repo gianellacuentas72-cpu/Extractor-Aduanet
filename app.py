@@ -21,16 +21,11 @@ def descargar_exportaciones_hibrido(fecha_inicio, fecha_fin, ruc):
     opciones.add_argument("--headless")
     opciones.add_argument("--no-sandbox")
     opciones.add_argument("--disable-dev-shm-usage")
-    opciones.add_argument("--disable-gpu") # Recomendado para estabilidad en Linux
+    opciones.add_argument("--disable-gpu")
     opciones.add_argument("user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64)")
 
-    # 1. Le indicamos la ruta exacta del navegador Chromium en Linux
     opciones.binary_location = "/usr/bin/chromium"
-    
-    # 2. Le indicamos la ruta del driver que instalamos por packages.txt
     servicio = Service("/usr/bin/chromedriver")
-    
-    # 3. Iniciamos el navegador con estas rutas fijas
     driver = webdriver.Chrome(service=servicio, options=opciones)
 
     url_busqueda = f"http://www.aduanet.gob.pe/cl-ad-consdespade/ConsExportIAServlet?accion=infDeta&FecInicial={fecha_inicio}&FecFinal={fecha_fin}&codseleccion=exportador&dato={ruc}&flagBusq=1&pTipoConsulta=infDeta"
@@ -69,12 +64,19 @@ def descargar_exportaciones_hibrido(fecha_inicio, fecha_fin, ruc):
     if not df_final.empty:
         col = df_final.columns[0]
         df_final[col] = df_final[col].astype(str)
-        df_final = df_final[~df_final[col].str.lower().str.contains(r'declaracion|declara|exportador|fec\.num|fob|neto', na=False)]
+        
+        # Filtramos la palabra 'informacion' para evitar la cabecera residual
+        df_final = df_final[~df_final[col].str.lower().str.contains(r'declaracion|declara|exportador|fec\.num|fob|neto|informacion', na=False)]
         df_final = df_final.dropna(how='all').reset_index(drop=True)
         
         cols = ['DESCLARACION', 'EXPORTADOR', 'FEC.NUM', 'AGENTE', "CANT SERIE'S", 'FOB TOT.', 'ALMACEN', 'AFORO', 'NETO TOT', '# BULTOS', 'PAIS DEST', 'SERIE', 'PARTIDA', 'DESC. COMER', 'DESC. PREST', 'DESC. MAT. CONST', 'DES. USO', 'DESC. OTROS', 'CANT', 'UNID.', 'PESO NETO', 'FOB']
         df_final = df_final.iloc[:, :len(cols)]
         df_final.columns = cols[:len(df_final.columns)]
+        
+        # Convertimos la columna FOB eliminando comas y forzando el formato numérico
+        if 'FOB' in df_final.columns:
+            df_final['FOB'] = df_final['FOB'].astype(str).str.replace(',', '', regex=False).str.strip()
+            df_final['FOB'] = pd.to_numeric(df_final['FOB'], errors='coerce')
             
     return df_final
 
