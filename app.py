@@ -72,9 +72,14 @@ def _descargar_bloque(fecha_inicio, fecha_fin, ruc):
     tabla_inicial = _extraer_mejor_tabla(html_inicial)
     todas_las_tablas = []
 
-    if tabla_inicial is not None and _contar_duas(tabla_inicial) >= total_registros * 0.9:
+    # La respuesta inicial de Selenium normalmente YA es la página 1 real: nunca se descarta.
+    if tabla_inicial is not None and _contar_duas(tabla_inicial) > 0:
         todas_las_tablas.append(tabla_inicial)
-    else:
+
+    duas_iniciales = _contar_duas(tabla_inicial) if tabla_inicial is not None else 0
+
+    if duas_iniciales < total_registros * 0.9:
+        # Todavía faltan registros por traer -> paginar el resto
         sesion = requests.Session()
         for cookie in cookies_selenium:
             sesion.cookies.set(cookie['name'], cookie['value'])
@@ -97,6 +102,8 @@ def _descargar_bloque(fecha_inicio, fecha_fin, ruc):
                 if duas_obtenidas >= esperadas:
                     break
                 time.sleep(2 * intento)
+
+            st.write(f"    Página {pagina}/{total_paginas}: {mejor_duas}/{esperadas} DUAs")
 
             if mejor_intento is not None:
                 todas_las_tablas.append(mejor_intento)
