@@ -28,7 +28,6 @@ def descargar_exportaciones_hibrido(fecha_inicio, fecha_fin, ruc):
     servicio = Service("/usr/bin/chromedriver")
     driver = webdriver.Chrome(service=servicio, options=opciones)
 
-    # 1. Usar Selenium como llave maestra para la sesión
     url_busqueda = f"http://www.aduanet.gob.pe/cl-ad-consdespade/ConsExportIAServlet?accion=infDeta&FecInicial={fecha_inicio}&FecFinal={fecha_fin}&codseleccion=exportador&dato={ruc}&flagBusq=1&pTipoConsulta=infDeta"
     driver.get(url_busqueda)
     time.sleep(3)
@@ -41,9 +40,9 @@ def descargar_exportaciones_hibrido(fecha_inicio, fecha_fin, ruc):
     if not match_total:
         return pd.DataFrame()
     total_registros = int(match_total.group(1))
+    st.write(f"🔎 [1] Total según SUNAT (texto 'de N'): {total_registros}")
 
     def extraer_mejor_tabla(html):
-        """Aísla la tabla interna correcta contando cuántas filas parecen DUAs (evita clones/ruido)."""
         try:
             tablas = pd.read_html(StringIO(html))
         except ValueError:
@@ -60,15 +59,16 @@ def descargar_exportaciones_hibrido(fecha_inicio, fecha_fin, ruc):
             best_t.columns = range(best_t.shape[1])
         return best_t
 
-    # 2. Revisar si la respuesta inicial YA trae todos los registros (interfaz sin paginación)
     tabla_inicial = extraer_mejor_tabla(html_inicial)
+    st.write(f"🔎 [2] Filas en tabla_inicial (cruda, sin limpiar): {len(tabla_inicial) if tabla_inicial is not None else 'None'}")
+
     todas_las_tablas = []
 
     if tabla_inicial is not None and len(tabla_inicial) >= total_registros * 0.9:
-        # La interfaz ya no pagina: todo vino en la respuesta inicial, no hace falta más
+        st.write("🔎 [3] Se usó la respuesta inicial directamente (SIN paginación)")
         todas_las_tablas.append(tabla_inicial)
     else:
-        # Fallback: sigue paginado (o algún mes distinto sí lo requiere) -> flujo anterior
+        st.write("🔎 [3] Se activó el FALLBACK de paginación (FrmPolizaporDetalle.jsp)")
         sesion = requests.Session()
         for cookie in cookies_selenium:
             sesion.cookies.set(cookie['name'], cookie['value'])
@@ -81,6 +81,8 @@ def descargar_exportaciones_hibrido(fecha_inicio, fecha_fin, ruc):
             resp_pag = sesion.post(url_paginacion, data={"tamanioPagina": "20", "pagina": str(pagina)})
             resp_pag.encoding = "ISO-8859-1"
             t = extraer_mejor_tabla(resp_pag.text)
+            filas_pag = len(t) if t is not None else 0
+            st.write(f"    Página {pagina}/{total_paginas}: {filas_pag} filas")
             if t is not None:
                 todas_las_tablas.append(t)
             time.sleep(1)
@@ -89,16 +91,17 @@ def descargar_exportaciones_hibrido(fecha_inicio, fecha_fin, ruc):
         return pd.DataFrame()
 
     df_final = pd.concat(todas_las_tablas, ignore_index=True)
+    st.write(f"🔎 [4] Filas tras concatenar todas las tablas: {len(df_final)}")
 
-    # --- LIMPIEZA FINAL QUIRÚRGICA ---
-    # Rescatar filas con celdas combinadas arrastrando la DUA hacia abajo
     df_final[0] = df_final[0].replace([None, 'nan', 'NaN', ''], pd.NA).ffill()
     df_final[1] = df_final[1].replace([None, 'nan', 'NaN', ''], pd.NA).ffill()
+    st.write(f"🔎 [5] Filas tras ffill (no debería cambiar la cantidad): {len(df_final)}")
 
-    # El Filtro de Oro: Conservar SOLO las filas donde el ítem (SERIE) sea un número real
     if df_final.shape[1] >= 12:
         mask_serie = pd.to_numeric(df_final[11], errors='coerce').notna()
+        filas_descartadas = (~mask_serie).sum()
         df_final = df_final[mask_serie].reset_index(drop=True)
+        st.write(f"🔎 [6] Filtro SERIE (columna 11) descartó {filas_descartadas} filas -> quedan {len(df_final)}")
 
     cols = ['DESCLARACION', 'EXPORTADOR', 'FEC.NUM', 'AGENTE', "CANT SERIE'S", 'FOB TOT.', 'ALMACEN', 'AFORO', 'NETO TOT', '# BULTOS', 'PAIS DEST', 'SERIE', 'PARTIDA', 'DESC. COMER', 'DESC. PREST', 'DESC. MAT. CONST', 'DES. USO', 'DESC. OTROS', 'CANT', 'UNID.', 'PESO NETO', 'FOB']
     df_final = df_final.iloc[:, :22]
@@ -108,14 +111,11 @@ def descargar_exportaciones_hibrido(fecha_inicio, fecha_fin, ruc):
         df_final['FOB'] = df_final['FOB'].astype(str).str.replace(',', '', regex=False).str.strip()
         df_final['FOB'] = pd.to_numeric(df_final['FOB'], errors='coerce')
 
-    # Eliminación por si la SUNAT devuelve la misma página dos veces por error de sesión
+    antes_dedup = len(df_final)
     df_final = df_final.drop_duplicates(ignore_index=True)
-
-    # Diagnóstico: compara lo esperado (texto "de N" de la web) contra lo realmente obtenido
-    print(f"[DIAGNÓSTICO] Total esperado según SUNAT: {total_registros} | Total obtenido tras limpieza: {len(df_final)}")
+    st.write(f"🔎 [7] drop_duplicates eliminó {antes_dedup - len(df_final)} filas -> total final: {len(df_final)}")
 
     return df_final
-
 
 ruc_input = st.text_input("RUC de la empresa:", value="20451899881")
 col1, col2 = st.columns(2)
