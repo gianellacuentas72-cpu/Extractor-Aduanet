@@ -28,7 +28,6 @@ def descargar_exportaciones_hibrido(fecha_inicio, fecha_fin, ruc):
     servicio = Service("/usr/bin/chromedriver")
     driver = webdriver.Chrome(service=servicio, options=opciones)
 
-    # 1. Obtenemos la Página 1
     url_busqueda = f"http://www.aduanet.gob.pe/cl-ad-consdespade/ConsExportIAServlet?accion=infDeta&FecInicial={fecha_inicio}&FecFinal={fecha_fin}&codseleccion=exportador&dato={ruc}&flagBusq=1&pTipoConsulta=infDeta"
     driver.get(url_busqueda)
     time.sleep(3) 
@@ -49,7 +48,6 @@ def descargar_exportaciones_hibrido(fecha_inicio, fecha_fin, ruc):
     total_registros = int(match_total.group(1))
     total_paginas = math.ceil(total_registros / 20)
 
-    # Juntamos los HTML de todas las páginas (La 1 de Selenium y el resto de requests)
     htmls = [html_pagina1]
     url_paginacion = "http://www.aduanet.gob.pe/cl-ad-consdespade/FrmPolizaporDetalle.jsp"
     for pagina in range(2, total_paginas + 1):
@@ -60,7 +58,6 @@ def descargar_exportaciones_hibrido(fecha_inicio, fecha_fin, ruc):
 
     todas_las_tablas = []
     
-    # --- LA SOLUCIÓN FINAL: Extracción por puntuación de DUA pura ---
     for html in htmls:
         try:
             tablas = pd.read_html(StringIO(html))
@@ -69,16 +66,13 @@ def descargar_exportaciones_hibrido(fecha_inicio, fecha_fin, ruc):
             
             for t in tablas:
                 if t.shape[1] >= 15: 
-                    # Contamos cuántas celdas son EXACTAMENTE un formato DUA (sin basura alrededor)
                     conteo = 0
                     for c in [0, 1]:
                         if c < t.shape[1]:
-                            # El regex ^...$ asegura que no haya nada más en la celda
                             matches = t.iloc[:, c].astype(str).str.contains(r'^\s*\d{3}-\d{4}-\d+\s*$', regex=True, na=False).sum()
                             if matches > conteo:
                                 conteo = matches
                     
-                    # Si esta tabla tiene más DUAs puras, es la verdadera. La guardamos.
                     if conteo > max_matches:
                         max_matches = conteo
                         best_t = t.copy()
@@ -91,10 +85,8 @@ def descargar_exportaciones_hibrido(fecha_inicio, fecha_fin, ruc):
 
     if not todas_las_tablas: return pd.DataFrame()
 
-    # Ahora sí, unimos solo 1 tabla perfecta por cada página
     df_final = pd.concat(todas_las_tablas, ignore_index=True)
     
-    # Limpieza final de cabeceras residuales
     col0 = df_final.columns[0]
     col1 = df_final.columns[1] if len(df_final.columns) > 1 else col0
     
@@ -103,18 +95,12 @@ def descargar_exportaciones_hibrido(fecha_inicio, fecha_fin, ruc):
            
     df_final = df_final[mask].reset_index(drop=True)
     
-    # Formateamos las 22 columnas
     cols = ['DESCLARACION', 'EXPORTADOR', 'FEC.NUM', 'AGENTE', "CANT SERIE'S", 'FOB TOT.', 'ALMACEN', 'AFORO', 'NETO TOT', '# BULTOS', 'PAIS DEST', 'SERIE', 'PARTIDA', 'DESC. COMER', 'DESC. PREST', 'DESC. MAT. CONST', 'DES. USO', 'DESC. OTROS', 'CANT', 'UNID.', 'PESO NETO', 'FOB']
     df_final = df_final.iloc[:, :len(cols)]
     df_final.columns = cols[:len(df_final.columns)]
     
-    # Doble seguro: Deduplicación por Llave Primaria por si acaso
-    if 'DESCLARACION' in df_final.columns and 'SERIE' in df_final.columns:
-        df_final['DESCLARACION'] = df_final['DESCLARACION'].astype(str).str.strip()
-        df_final['SERIE'] = df_final['SERIE'].astype(str).str.strip()
-        df_final = df_final.drop_duplicates(subset=['DESCLARACION', 'SERIE'], keep='first', ignore_index=True)
+    # Hemos eliminado el drop_duplicates para permitir filas gemelas válidas
     
-    # Arreglamos los números
     if 'FOB' in df_final.columns:
         df_final['FOB'] = df_final['FOB'].astype(str).str.replace(',', '', regex=False).str.strip()
         df_final['FOB'] = pd.to_numeric(df_final['FOB'], errors='coerce')
