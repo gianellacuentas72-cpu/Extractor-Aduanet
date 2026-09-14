@@ -15,33 +15,6 @@ import calendar
 st.set_page_config(page_title="Extractor Sunat - Prolan", page_icon="📊", layout="centered")
 st.title("📊 Extractor Automático de Exportaciones")
 
-# --- EL ALGORITMO INTELIGENTE PARA TABLAS ANIDADAS ---
-def extraer_tabla_correcta(html_source):
-    try:
-        tablas = pd.read_html(StringIO(html_source))
-        candidatas = []
-        for t in tablas:
-            if t.shape[1] >= 15:
-                # Estandarizamos los nombres de columnas a números (0, 1, 2...)
-                t.columns = range(t.shape[1])
-                # Contamos cuántas filas válidas (DUA) tiene esta tabla
-                mask = t[0].astype(str).str.contains(r'\d{3}-\d{4}-\d+', regex=True) | \
-                       t[1].astype(str).str.contains(r'\d{3}-\d{4}-\d+', regex=True)
-                filas_validas = mask.sum()
-                
-                if filas_validas > 0:
-                    # Guardamos: (Cantidad_DUAS, Total_Filas, DataFrame)
-                    candidatas.append((filas_validas, t.shape[0], t))
-        
-        if candidatas:
-            # MAGIA: Ordenamos priorizando MÁS filas válidas, y en caso de empate, MENOS filas totales (para descartar la tabla externa)
-            candidatas.sort(key=lambda x: (x[0], -x[1]), reverse=True)
-            return candidatas[0][2] # Retornamos solo la tabla perfecta
-    except Exception:
-        pass
-    return pd.DataFrame()
-
-
 @st.cache_data(show_spinner=False)
 def descargar_exportaciones_hibrido(fecha_inicio, fecha_fin, ruc):
     opciones = Options()
@@ -76,37 +49,45 @@ def descargar_exportaciones_hibrido(fecha_inicio, fecha_fin, ruc):
     total_registros = int(match_total.group(1))
     total_paginas = math.ceil(total_registros / 20)
 
-    todas_las_tablas = []
-    
-    # Extraemos Página 1
-    t1 = extraer_tabla_correcta(html_pagina1)
-    if not t1.empty:
-        todas_las_tablas.append(t1)
-
-    # Extraemos Páginas 2 en adelante
+    htmls = [html_pagina1]
     url_paginacion = "http://www.aduanet.gob.pe/cl-ad-consdespade/FrmPolizaporDetalle.jsp"
     for pagina in range(2, total_paginas + 1):
         resp_pag = sesion.post(url_paginacion, data={"tamanioPagina": "20", "pagina": str(pagina)})
         resp_pag.encoding = "ISO-8859-1"
-        t_pag = extraer_tabla_correcta(resp_pag.text)
-        if not t_pag.empty:
-            todas_las_tablas.append(t_pag)
+        htmls.append(resp_pag.text)
         time.sleep(1)
+
+    todas_las_tablas = []
+    
+    # Extraemos todo (incluso las tablas anidadas)
+    for html in htmls:
+        try:
+            tablas = pd.read_html(StringIO(html))
+            for t in tablas:
+                if t.shape[1] >= 15: 
+                    t.columns = range(t.shape[1]) 
+                    todas_las_tablas.append(t)
+        except ValueError:
+            continue
 
     if not todas_las_tablas: return pd.DataFrame()
 
     df_final = pd.concat(todas_las_tablas, ignore_index=True)
     
-    # --- LIMPIEZA FINAL ---
-    col0 = df_final.columns[0]
-    col1 = df_final.columns[1] if len(df_final.columns) > 1 else col0
+    # --- LÓGICA DE LIMPIEZA MAESTRA ---
     
-    # Nos quedamos estrictamente con las filas de datos
-    mask = df_final[col0].astype(str).str.contains(r'\d{3}-\d{4}-\d+', regex=True) | \
-           df_final[col1].astype(str).str.contains(r'\d{3}-\d{4}-\d+', regex=True)
-           
-    df_final = df_final[mask].reset_index(drop=True)
+    # 1. Matamos a los clones de las tablas anidadas (De 540 baja a los registros únicos + cabeceras)
+    df_final = df_final.astype(str).drop_duplicates(ignore_index=True)
     
+    # 2. EL FILTRO INFALIBLE: Si la columna 11 (SERIE) es un número, es una fila de datos real.
+    if df_final.shape[1] >= 12:
+        mask_serie = pd.to_numeric(df_final.iloc[:, 11], errors='coerce').notna()
+        df_final = df_final[mask_serie].reset_index(drop=True)
+        
+        # 3. EL RESCATE DE LOS 6 REGISTROS: Rellenamos las celdas combinadas (DUA y EXPORTADOR) hacia abajo
+        df_final.iloc[:, 0] = df_final.iloc[:, 0].replace(['nan', 'NaN', 'None', ''], pd.NA).ffill()
+        df_final.iloc[:, 1] = df_final.iloc[:, 1].replace(['nan', 'NaN', 'None', ''], pd.NA).ffill()
+
     # Formateamos las 22 columnas exactas
     cols = ['DESCLARACION', 'EXPORTADOR', 'FEC.NUM', 'AGENTE', "CANT SERIE'S", 'FOB TOT.', 'ALMACEN', 'AFORO', 'NETO TOT', '# BULTOS', 'PAIS DEST', 'SERIE', 'PARTIDA', 'DESC. COMER', 'DESC. PREST', 'DESC. MAT. CONST', 'DES. USO', 'DESC. OTROS', 'CANT', 'UNID.', 'PESO NETO', 'FOB']
     df_final = df_final.iloc[:, :len(cols)]
@@ -118,7 +99,6 @@ def descargar_exportaciones_hibrido(fecha_inicio, fecha_fin, ruc):
         df_final['FOB'] = pd.to_numeric(df_final['FOB'], errors='coerce')
         
     return df_final
-
 
 ruc_input = st.text_input("RUC de la empresa:", value="20451899881")
 col1, col2 = st.columns(2)
