@@ -28,6 +28,7 @@ def descargar_exportaciones_hibrido(fecha_inicio, fecha_fin, ruc):
     servicio = Service("/usr/bin/chromedriver")
     driver = webdriver.Chrome(service=servicio, options=opciones)
 
+    # 1. Obtenemos la Página 1
     url_busqueda = f"http://www.aduanet.gob.pe/cl-ad-consdespade/ConsExportIAServlet?accion=infDeta&FecInicial={fecha_inicio}&FecFinal={fecha_fin}&codseleccion=exportador&dato={ruc}&flagBusq=1&pTipoConsulta=infDeta"
     driver.get(url_busqueda)
     time.sleep(3) 
@@ -48,6 +49,7 @@ def descargar_exportaciones_hibrido(fecha_inicio, fecha_fin, ruc):
     total_registros = int(match_total.group(1))
     total_paginas = math.ceil(total_registros / 20)
 
+    # Juntamos los HTML
     htmls = [html_pagina1]
     url_paginacion = "http://www.aduanet.gob.pe/cl-ad-consdespade/FrmPolizaporDetalle.jsp"
     for pagina in range(2, total_paginas + 1):
@@ -58,28 +60,14 @@ def descargar_exportaciones_hibrido(fecha_inicio, fecha_fin, ruc):
 
     todas_las_tablas = []
     
+    # ATRAPAMOS TODAS LAS TABLAS PARA NO PERDER LOS 6 REGISTROS ROTOS
     for html in htmls:
         try:
             tablas = pd.read_html(StringIO(html))
-            best_t = None
-            max_matches = 0
-            
             for t in tablas:
                 if t.shape[1] >= 15: 
-                    conteo = 0
-                    for c in [0, 1]:
-                        if c < t.shape[1]:
-                            matches = t.iloc[:, c].astype(str).str.contains(r'^\s*\d{3}-\d{4}-\d+\s*$', regex=True, na=False).sum()
-                            if matches > conteo:
-                                conteo = matches
-                    
-                    if conteo > max_matches:
-                        max_matches = conteo
-                        best_t = t.copy()
-                        
-            if best_t is not None:
-                best_t.columns = range(best_t.shape[1]) 
-                todas_las_tablas.append(best_t)
+                    t.columns = range(t.shape[1]) 
+                    todas_las_tablas.append(t)
         except ValueError:
             continue
 
@@ -87,20 +75,31 @@ def descargar_exportaciones_hibrido(fecha_inicio, fecha_fin, ruc):
 
     df_final = pd.concat(todas_las_tablas, ignore_index=True)
     
+    # --- LÓGICA DE LIMPIEZA MAESTRA ---
     col0 = df_final.columns[0]
     col1 = df_final.columns[1] if len(df_final.columns) > 1 else col0
     
+    # 1. Filtramos las filas reales (DUA)
     mask = df_final[col0].astype(str).str.contains(r'\d{3}-\d{4}-\d+', regex=True) | \
            df_final[col1].astype(str).str.contains(r'\d{3}-\d{4}-\d+', regex=True)
            
     df_final = df_final[mask].reset_index(drop=True)
     
+    # 2. Formateamos las 22 columnas
     cols = ['DESCLARACION', 'EXPORTADOR', 'FEC.NUM', 'AGENTE', "CANT SERIE'S", 'FOB TOT.', 'ALMACEN', 'AFORO', 'NETO TOT', '# BULTOS', 'PAIS DEST', 'SERIE', 'PARTIDA', 'DESC. COMER', 'DESC. PREST', 'DESC. MAT. CONST', 'DES. USO', 'DESC. OTROS', 'CANT', 'UNID.', 'PESO NETO', 'FOB']
     df_final = df_final.iloc[:, :len(cols)]
     df_final.columns = cols[:len(df_final.columns)]
     
-    # Hemos eliminado el drop_duplicates para permitir filas gemelas válidas
+    # 3. EL BISTURÍ: Deduplicación por Llave Compuesta
+    # Limpiamos espacios para que la comparación sea perfecta
+    for c in ['DESCLARACION', 'SERIE', 'PESO NETO']:
+        if c in df_final.columns:
+            df_final[c] = df_final[c].astype(str).str.strip()
+            
+    # Borramos clones SOLAMENTE si coinciden en DUA + Serie + Peso Neto
+    df_final = df_final.drop_duplicates(subset=['DESCLARACION', 'SERIE', 'PESO NETO'], keep='first', ignore_index=True)
     
+    # 4. Arreglamos los números
     if 'FOB' in df_final.columns:
         df_final['FOB'] = df_final['FOB'].astype(str).str.replace(',', '', regex=False).str.strip()
         df_final['FOB'] = pd.to_numeric(df_final['FOB'], errors='coerce')
