@@ -21,16 +21,11 @@ def descargar_exportaciones_hibrido(fecha_inicio, fecha_fin, ruc):
     opciones.add_argument("--headless")
     opciones.add_argument("--no-sandbox")
     opciones.add_argument("--disable-dev-shm-usage")
-    opciones.add_argument("--disable-gpu") # Recomendado para estabilidad en Linux
+    opciones.add_argument("--disable-gpu")
     opciones.add_argument("user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64)")
 
-    # 1. Le indicamos la ruta exacta del navegador Chromium en Linux
     opciones.binary_location = "/usr/bin/chromium"
-    
-    # 2. Le indicamos la ruta del driver que instalamos por packages.txt
     servicio = Service("/usr/bin/chromedriver")
-    
-    # 3. Iniciamos el navegador con estas rutas fijas
     driver = webdriver.Chrome(service=servicio, options=opciones)
 
     url_busqueda = f"http://www.aduanet.gob.pe/cl-ad-consdespade/ConsExportIAServlet?accion=infDeta&FecInicial={fecha_inicio}&FecFinal={fecha_fin}&codseleccion=exportador&dato={ruc}&flagBusq=1&pTipoConsulta=infDeta"
@@ -53,42 +48,43 @@ def descargar_exportaciones_hibrido(fecha_inicio, fecha_fin, ruc):
     total_registros = int(match_total.group(1))
     total_paginas = math.ceil(total_registros / 20)
 
-    # CORRECCIÓN DE PAGINACIÓN: Bucle estricto desde la página 1 para no perder registros
-    todas_las_tablas = []
+    # CORRECCIÓN DE EXTRACCIÓN: Usamos t.size para garantizar la captura de la tabla de 22 columnas
+    tablas_pagina1 = pd.read_html(StringIO(html_pagina1))
+    todas_las_tablas = [max(tablas_pagina1, key=lambda t: t.size)]
+
     url_paginacion = "http://www.aduanet.gob.pe/cl-ad-consdespade/FrmPolizaporDetalle.jsp"
     
-    for pagina in range(1, total_paginas + 1):
+    # Continuamos con requests desde la página 2
+    for pagina in range(2, total_paginas + 1):
         resp_pag = sesion.post(url_paginacion, data={"tamanioPagina": "20", "pagina": str(pagina)})
         resp_pag.encoding = "ISO-8859-1"
         try:
             tablas_pag = pd.read_html(StringIO(resp_pag.text))
-            todas_las_tablas.append(max(tablas_pag, key=len))
+            todas_las_tablas.append(max(tablas_pag, key=lambda t: t.size))
         except ValueError:
             continue
         time.sleep(1)
 
-    if not todas_las_tablas:
-        return pd.DataFrame()
+    if not todas_las_tablas: return pd.DataFrame()
 
     df_final = pd.concat(todas_las_tablas, ignore_index=True)
     
-    if not df_final.empty:
-        col = df_final.columns[0]
-        df_final[col] = df_final[col].astype(str)
+    col = df_final.columns[0]
+    df_final[col] = df_final[col].astype(str)
+    
+    # Filtros de limpieza aplicados
+    df_final = df_final[~df_final[col].str.lower().str.contains(r'declaracion|declara|exportador|fec\.num|fob|neto|informacion', na=False)]
+    df_final = df_final.dropna(how='all').reset_index(drop=True)
+    
+    cols = ['DESCLARACION', 'EXPORTADOR', 'FEC.NUM', 'AGENTE', "CANT SERIE'S", 'FOB TOT.', 'ALMACEN', 'AFORO', 'NETO TOT', '# BULTOS', 'PAIS DEST', 'SERIE', 'PARTIDA', 'DESC. COMER', 'DESC. PREST', 'DESC. MAT. CONST', 'DES. USO', 'DESC. OTROS', 'CANT', 'UNID.', 'PESO NETO', 'FOB']
+    df_final = df_final.iloc[:, :len(cols)]
+    df_final.columns = cols[:len(df_final.columns)]
+    
+    # Conversión estricta de formato numérico para la columna FOB
+    if 'FOB' in df_final.columns:
+        df_final['FOB'] = df_final['FOB'].astype(str).str.replace(',', '', regex=False).str.strip()
+        df_final['FOB'] = pd.to_numeric(df_final['FOB'], errors='coerce')
         
-        # FILTRO: Eliminamos la palabra 'informacion' y otros encabezados residuales
-        df_final = df_final[~df_final[col].str.lower().str.contains(r'declaracion|declara|exportador|fec\.num|fob|neto|informacion', na=False)]
-        df_final = df_final.dropna(how='all').reset_index(drop=True)
-        
-        cols = ['DESCLARACION', 'EXPORTADOR', 'FEC.NUM', 'AGENTE', "CANT SERIE'S", 'FOB TOT.', 'ALMACEN', 'AFORO', 'NETO TOT', '# BULTOS', 'PAIS DEST', 'SERIE', 'PARTIDA', 'DESC. COMER', 'DESC. PREST', 'DESC. MAT. CONST', 'DES. USO', 'DESC. OTROS', 'CANT', 'UNID.', 'PESO NETO', 'FOB']
-        df_final = df_final.iloc[:, :len(cols)]
-        df_final.columns = cols[:len(df_final.columns)]
-        
-        # FORMATO NUMÉRICO: Convertimos la columna FOB a número limpio
-        if 'FOB' in df_final.columns:
-            df_final['FOB'] = df_final['FOB'].astype(str).str.replace(',', '', regex=False).str.strip()
-            df_final['FOB'] = pd.to_numeric(df_final['FOB'], errors='coerce')
-            
     return df_final
 
 ruc_input = st.text_input("RUC de la empresa:", value="20451899881")
@@ -127,7 +123,3 @@ if st.button("🚀 Extraer Datos", type="primary"):
             st.warning("No se encontraron datos.")
     except ValueError:
         st.error("Formato de fecha incorrecto. Usa DDMMAAAA.")
-
-    except ValueError:
-
-        st.error("Formato de fecha incorrecto. Usa DDMMAAAA.") 
