@@ -60,13 +60,12 @@ def descargar_exportaciones_hibrido(fecha_inicio, fecha_fin, ruc):
 
     todas_las_tablas = []
     
-    # EL TRUCO: Agarramos TODAS las tablas partidas y las estandarizamos
+    # Extraemos todo para no perder ni un solo registro escondido
     for html in htmls:
         try:
             tablas = pd.read_html(StringIO(html))
             for t in tablas:
-                if t.shape[1] >= 15: # Si tiene 15 columnas o más, es tabla de datos
-                    # Renombramos las columnas a números (0, 1, 2...) para que pd.concat las apile perfecto
+                if t.shape[1] >= 15: 
                     t.columns = range(t.shape[1]) 
                     todas_las_tablas.append(t)
         except ValueError:
@@ -76,22 +75,25 @@ def descargar_exportaciones_hibrido(fecha_inicio, fecha_fin, ruc):
 
     df_final = pd.concat(todas_las_tablas, ignore_index=True)
     
-    # --- LÓGICA DE LIMPIEZA BLINDADA ---
+    # --- LÓGICA DE LIMPIEZA ---
     col0 = df_final.columns[0]
     col1 = df_final.columns[1] if len(df_final.columns) > 1 else col0
     
-    # Filtramos conservando únicamente las filas que tengan el código DUA
+    # 1. Filtramos solo filas que tengan un código válido de DUA
     mask = df_final[col0].astype(str).str.contains(r'\d{3}-\d{4}-\d+', regex=True) | \
            df_final[col1].astype(str).str.contains(r'\d{3}-\d{4}-\d+', regex=True)
            
     df_final = df_final[mask].reset_index(drop=True)
     
-    # Formateamos y nombramos las 22 columnas exactas
+    # 2. Formateamos las 22 columnas
     cols = ['DESCLARACION', 'EXPORTADOR', 'FEC.NUM', 'AGENTE', "CANT SERIE'S", 'FOB TOT.', 'ALMACEN', 'AFORO', 'NETO TOT', '# BULTOS', 'PAIS DEST', 'SERIE', 'PARTIDA', 'DESC. COMER', 'DESC. PREST', 'DESC. MAT. CONST', 'DES. USO', 'DESC. OTROS', 'CANT', 'UNID.', 'PESO NETO', 'FOB']
     df_final = df_final.iloc[:, :22]
     df_final.columns = cols[:len(df_final.columns)]
     
-    # Forzamos la columna FOB a número decimal
+    # 3. ELIMINAMOS CLONES EXACTOS (La magia para bajar de 544 a 285)
+    df_final = df_final.drop_duplicates(ignore_index=True)
+    
+    # 4. Arreglamos los números
     if 'FOB' in df_final.columns:
         df_final['FOB'] = df_final['FOB'].astype(str).str.replace(',', '', regex=False).str.strip()
         df_final['FOB'] = pd.to_numeric(df_final['FOB'], errors='coerce')
