@@ -15,6 +15,32 @@ import calendar
 st.set_page_config(page_title="Extractor Sunat - Prolan", page_icon="📊", layout="centered")
 st.title("📊 Extractor Automático de Exportaciones")
 
+# --- EL BISTURÍ DEFINITIVO (Adiós Pandas read_html) ---
+def extraer_datos_puros(html_source):
+    datos = []
+    # 1. Rompemos el HTML crudo en filas <tr>
+    filas = re.findall(r'<tr[^>]*>(.*?)</tr>', html_source, re.IGNORECASE | re.DOTALL)
+    for fila in filas:
+        # 2. Extraemos las celdas <td> o <th> de cada fila
+        celdas = re.findall(r'<t[dh][^>]*>(.*?)</t[dh]>', fila, re.IGNORECASE | re.DOTALL)
+        
+        # 3. Filtramos la tabla externa clonada (la tabla externa solo tiene 1 o 2 celdas gigantes)
+        if len(celdas) >= 15:
+            # Limpiamos etiquetas internas invisibles y espacios
+            celdas = [re.sub(r'<[^>]+>', '', c).replace('&nbsp;', '').strip() for c in celdas]
+            
+            # Estandarizamos a 22 columnas exactas
+            celdas = celdas + [None] * (22 - len(celdas))
+            celdas = celdas[:22]
+            
+            # 4. Condición de Vida: ¿Es una fila de datos real?
+            # O tiene la DUA en la celda 0, O tiene un número de SERIE en la celda 11
+            if (celdas[0] and re.search(r'\d{3}-\d{4}-\d+', str(celdas[0]))) or \
+               (celdas[11] and str(celdas[11]).isdigit()):
+                datos.append(celdas)
+                
+    return pd.DataFrame(datos) if datos else pd.DataFrame()
+
 @st.cache_data(show_spinner=False)
 def descargar_exportaciones_hibrido(fecha_inicio, fecha_fin, ruc):
     opciones = Options()
@@ -28,7 +54,6 @@ def descargar_exportaciones_hibrido(fecha_inicio, fecha_fin, ruc):
     servicio = Service("/usr/bin/chromedriver")
     driver = webdriver.Chrome(service=servicio, options=opciones)
 
-    # 1. Obtenemos la Página 1
     url_busqueda = f"http://www.aduanet.gob.pe/cl-ad-consdespade/ConsExportIAServlet?accion=infDeta&FecInicial={fecha_inicio}&FecFinal={fecha_fin}&codseleccion=exportador&dato={ruc}&flagBusq=1&pTipoConsulta=infDeta"
     driver.get(url_busqueda)
     time.sleep(3) 
@@ -51,6 +76,7 @@ def descargar_exportaciones_hibrido(fecha_inicio, fecha_fin, ruc):
 
     htmls = [html_pagina1]
     url_paginacion = "http://www.aduanet.gob.pe/cl-ad-consdespade/FrmPolizaporDetalle.jsp"
+    
     for pagina in range(2, total_paginas + 1):
         resp_pag = sesion.post(url_paginacion, data={"tamanioPagina": "20", "pagina": str(pagina)})
         resp_pag.encoding = "ISO-8859-1"
@@ -59,41 +85,26 @@ def descargar_exportaciones_hibrido(fecha_inicio, fecha_fin, ruc):
 
     todas_las_tablas = []
     
-    # Extraemos todo (incluso las tablas anidadas)
+    # Procesamos todas las páginas con el bisturí
     for html in htmls:
-        try:
-            tablas = pd.read_html(StringIO(html))
-            for t in tablas:
-                if t.shape[1] >= 15: 
-                    t.columns = range(t.shape[1]) 
-                    todas_las_tablas.append(t)
-        except ValueError:
-            continue
+        t = extraer_datos_puros(html)
+        if not t.empty:
+            todas_las_tablas.append(t)
 
     if not todas_las_tablas: return pd.DataFrame()
 
     df_final = pd.concat(todas_las_tablas, ignore_index=True)
     
-    # --- LÓGICA DE LIMPIEZA MAESTRA ---
+    # --- LIMPIEZA FINAL PERFECTA ---
+    # 1. Rescatamos los 6 registros huérfanos: Rellenamos hacia abajo la DUA y el Exportador
+    df_final.iloc[:, 0] = df_final.iloc[:, 0].replace(['', 'None', None], pd.NA).ffill()
+    df_final.iloc[:, 1] = df_final.iloc[:, 1].replace(['', 'None', None], pd.NA).ffill()
     
-    # 1. Matamos a los clones de las tablas anidadas (De 540 baja a los registros únicos + cabeceras)
-    df_final = df_final.astype(str).drop_duplicates(ignore_index=True)
-    
-    # 2. EL FILTRO INFALIBLE: Si la columna 11 (SERIE) es un número, es una fila de datos real.
-    if df_final.shape[1] >= 12:
-        mask_serie = pd.to_numeric(df_final.iloc[:, 11], errors='coerce').notna()
-        df_final = df_final[mask_serie].reset_index(drop=True)
-        
-        # 3. EL RESCATE DE LOS 6 REGISTROS: Rellenamos las celdas combinadas (DUA y EXPORTADOR) hacia abajo
-        df_final.iloc[:, 0] = df_final.iloc[:, 0].replace(['nan', 'NaN', 'None', ''], pd.NA).ffill()
-        df_final.iloc[:, 1] = df_final.iloc[:, 1].replace(['nan', 'NaN', 'None', ''], pd.NA).ffill()
-
-    # Formateamos las 22 columnas exactas
+    # Nombramos las 22 columnas
     cols = ['DESCLARACION', 'EXPORTADOR', 'FEC.NUM', 'AGENTE', "CANT SERIE'S", 'FOB TOT.', 'ALMACEN', 'AFORO', 'NETO TOT', '# BULTOS', 'PAIS DEST', 'SERIE', 'PARTIDA', 'DESC. COMER', 'DESC. PREST', 'DESC. MAT. CONST', 'DES. USO', 'DESC. OTROS', 'CANT', 'UNID.', 'PESO NETO', 'FOB']
-    df_final = df_final.iloc[:, :len(cols)]
-    df_final.columns = cols[:len(df_final.columns)]
+    df_final.columns = cols
     
-    # Arreglamos los números
+    # Forzamos la columna FOB a número decimal
     if 'FOB' in df_final.columns:
         df_final['FOB'] = df_final['FOB'].astype(str).str.replace(',', '', regex=False).str.strip()
         df_final['FOB'] = pd.to_numeric(df_final['FOB'], errors='coerce')
