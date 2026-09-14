@@ -48,17 +48,22 @@ def descargar_exportaciones_hibrido(fecha_inicio, fecha_fin, ruc):
     total_registros = int(match_total.group(1))
     total_paginas = math.ceil(total_registros / 20)
 
-    # SOLUCIÓN: Lista vacía. Obligamos a requests a descargar desde la PÁGINA 1
-    todas_las_tablas = []
+    # 1. Captura infalible de la Página 1 buscando la columna específica
+    try:
+        tablas_pagina1 = pd.read_html(StringIO(html_pagina1), match="FOB TOT.")
+        todas_las_tablas = [tablas_pagina1[0]]
+    except ValueError:
+        todas_las_tablas = []
+
     url_paginacion = "http://www.aduanet.gob.pe/cl-ad-consdespade/FrmPolizaporDetalle.jsp"
     
-    # El rango ahora empieza en 1
-    for pagina in range(1, total_paginas + 1):
+    # 2. Descarga de la Página 2 en adelante con requests
+    for pagina in range(2, total_paginas + 1):
         resp_pag = sesion.post(url_paginacion, data={"tamanioPagina": "20", "pagina": str(pagina)})
         resp_pag.encoding = "ISO-8859-1"
         try:
-            tablas_pag = pd.read_html(StringIO(resp_pag.text))
-            todas_las_tablas.append(max(tablas_pag, key=lambda t: t.size))
+            tablas_pag = pd.read_html(StringIO(resp_pag.text), match="FOB TOT.")
+            todas_las_tablas.append(tablas_pag[0])
         except ValueError:
             continue
         time.sleep(1)
@@ -70,7 +75,6 @@ def descargar_exportaciones_hibrido(fecha_inicio, fecha_fin, ruc):
     col = df_final.columns[0]
     df_final[col] = df_final[col].astype(str)
     
-    # Filtros de limpieza aplicados
     df_final = df_final[~df_final[col].str.lower().str.contains(r'declaracion|declara|exportador|fec\.num|fob|neto|informacion', na=False)]
     df_final = df_final.dropna(how='all').reset_index(drop=True)
     
@@ -78,7 +82,6 @@ def descargar_exportaciones_hibrido(fecha_inicio, fecha_fin, ruc):
     df_final = df_final.iloc[:, :len(cols)]
     df_final.columns = cols[:len(df_final.columns)]
     
-    # Conversión estricta de formato numérico para la columna FOB
     if 'FOB' in df_final.columns:
         df_final['FOB'] = df_final['FOB'].astype(str).str.replace(',', '', regex=False).str.strip()
         df_final['FOB'] = pd.to_numeric(df_final['FOB'], errors='coerce')
