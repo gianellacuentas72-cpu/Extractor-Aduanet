@@ -75,22 +75,23 @@ def descargar_exportaciones_hibrido(fecha_inicio, fecha_fin, ruc):
             sesion.cookies.set(cookie['name'], cookie['value'])
         sesion.headers.update({"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)", "Referer": url_busqueda})
 
-        total_paginas = math.ceil(total_registros / 20)
+        TAMANIO_PAGINA = 100  # antes 20 -- probando bloques más grandes para evitar el corte en "página 14"
+        total_paginas = math.ceil(total_registros / TAMANIO_PAGINA)
         url_paginacion = "http://www.aduanet.gob.pe/cl-ad-consdespade/FrmPolizaporDetalle.jsp"
 
         for pagina in range(1, total_paginas + 1):
-            # Cuántas DUAs reales esperamos en esta página (la última puede traer menos de 20)
+            # Cuántas DUAs reales esperamos en esta página (la última puede traer menos)
             if pagina < total_paginas:
-                esperadas = 20
+                esperadas = TAMANIO_PAGINA
             else:
-                esperadas = total_registros - 20 * (total_paginas - 1)
+                esperadas = total_registros - TAMANIO_PAGINA * (total_paginas - 1)
 
             mejor_intento = None
             mejor_duas = -1
             intentos = 3
 
             for intento in range(1, intentos + 1):
-                resp_pag = sesion.post(url_paginacion, data={"tamanioPagina": "20", "pagina": str(pagina)})
+                resp_pag = sesion.post(url_paginacion, data={"tamanioPagina": str(TAMANIO_PAGINA), "pagina": str(pagina)})
                 resp_pag.encoding = "ISO-8859-1"
                 t = extraer_mejor_tabla(resp_pag.text)
                 duas_obtenidas = contar_duas(t)
