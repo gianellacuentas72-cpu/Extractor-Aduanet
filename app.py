@@ -15,13 +15,26 @@ import calendar
 st.set_page_config(page_title="Extractor Sunat - Prolan", page_icon="📊", layout="centered")
 st.title("📊 Extractor Automático de Exportaciones")
 
+# --- NUEVA FUNCIÓN: Filtro estricto de tablas por columnas ---
+def extraer_tabla_datos(html_source):
+    try:
+        tablas = pd.read_html(StringIO(html_source))
+        # Filtramos estrictamente tablas con 15 columnas o más (la real tiene 22)
+        tablas_validas = [t for t in tablas if t.shape[1] >= 15]
+        if tablas_validas:
+            # Si encuentra más de una, tomamos la que tenga más filas de datos
+            return max(tablas_validas, key=lambda t: t.shape[0])
+    except Exception:
+        pass
+    return None
+
 @st.cache_data(show_spinner=False)
 def descargar_exportaciones_hibrido(fecha_inicio, fecha_fin, ruc):
     opciones = Options()
     opciones.add_argument("--headless")
     opciones.add_argument("--no-sandbox")
     opciones.add_argument("--disable-dev-shm-usage")
-    opciones.add_argument("--disable-gpu")
+    opciones.add_argument("--disable-gpu") 
     opciones.add_argument("user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64)")
 
     opciones.binary_location = "/usr/bin/chromium"
@@ -48,24 +61,21 @@ def descargar_exportaciones_hibrido(fecha_inicio, fecha_fin, ruc):
     total_registros = int(match_total.group(1))
     total_paginas = math.ceil(total_registros / 20)
 
-    # 1. Captura infalible de la Página 1 buscando la columna específica
-    try:
-        tablas_pagina1 = pd.read_html(StringIO(html_pagina1), match="FOB TOT.")
-        todas_las_tablas = [tablas_pagina1[0]]
-    except ValueError:
-        todas_las_tablas = []
-
-    url_paginacion = "http://www.aduanet.gob.pe/cl-ad-consdespade/FrmPolizaporDetalle.jsp"
+    todas_las_tablas = []
     
-    # 2. Descarga de la Página 2 en adelante con requests
+    # 1. EXTRACCIÓN PÁGINA 1 (Infalible)
+    t1 = extraer_tabla_datos(html_pagina1)
+    if t1 is not None:
+        todas_las_tablas.append(t1)
+
+    # 2. EXTRACCIÓN PÁGINA 2 EN ADELANTE
+    url_paginacion = "http://www.aduanet.gob.pe/cl-ad-consdespade/FrmPolizaporDetalle.jsp"
     for pagina in range(2, total_paginas + 1):
         resp_pag = sesion.post(url_paginacion, data={"tamanioPagina": "20", "pagina": str(pagina)})
         resp_pag.encoding = "ISO-8859-1"
-        try:
-            tablas_pag = pd.read_html(StringIO(resp_pag.text), match="FOB TOT.")
-            todas_las_tablas.append(tablas_pag[0])
-        except ValueError:
-            continue
+        t = extraer_tabla_datos(resp_pag.text)
+        if t is not None:
+            todas_las_tablas.append(t)
         time.sleep(1)
 
     if not todas_las_tablas: return pd.DataFrame()
