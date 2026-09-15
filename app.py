@@ -16,7 +16,7 @@ st.set_page_config(page_title="Extractor Sunat - Prolan", page_icon="📊", layo
 st.title("📊 Extractor Automático de Exportaciones")
 
 def _contar_duas(t):
-    if t is None:
+    if t is None or t.empty:
         return 0
     return int(t.iloc[:, 0].astype(str).str.contains(r'\d{3}-\d{4}-\d+', regex=True).sum() +
                t.iloc[:, 1].astype(str).str.contains(r'\d{3}-\d{4}-\d+', regex=True).sum())
@@ -67,24 +67,29 @@ def descargar_exportaciones_mes(fecha_inicio, fecha_fin, ruc):
     total_registros = int(match_total.group(1))
     total_paginas = math.ceil(total_registros / 20)
 
+    todas_las_tablas = []
+    
+    # --- EL SALVAVIDAS: Rescatamos la Página 1 que Selenium ya vio ---
+    tabla_inicial = _extraer_mejor_tabla(html_inicial)
+    if tabla_inicial is not None and _contar_duas(tabla_inicial) > 0:
+        todas_las_tablas.append(tabla_inicial)
+
     sesion = requests.Session()
     for cookie in cookies_selenium:
         sesion.cookies.set(cookie['name'], cookie['value'])
     sesion.headers.update({"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)", "Referer": url_busqueda})
 
     url_paginacion = "http://www.aduanet.gob.pe/cl-ad-consdespade/FrmPolizaporDetalle.jsp"
-    todas_las_tablas = []
 
     texto_progreso = st.empty()
     barra_progreso = st.progress(0)
 
-    # --- BUCLE BLINDADO (Modo Tanque) ---
+    # --- BUCLE BLINDADO (Descargamos todo por Requests) ---
     for pagina in range(1, total_paginas + 1):
         esperadas = 20 if pagina < total_paginas else total_registros - 20 * (total_paginas - 1)
         mejor_tabla = None
         mejor_duas = -1
 
-        # Hasta 5 intentos agresivos si la página de la SUNAT se niega a cargar
         for intento in range(1, 6):
             try:
                 resp_pag = sesion.post(url_paginacion, data={"tamanioPagina": "20", "pagina": str(pagina)}, timeout=20)
@@ -97,20 +102,17 @@ def descargar_exportaciones_mes(fecha_inicio, fecha_fin, ruc):
                     mejor_tabla = t
                     
                 if duas >= esperadas:
-                    break # Salimos del reintento, la página vino completa
+                    break 
                 else:
-                    time.sleep(2 * intento) # Castigo de tiempo progresivo (2s, 4s, 6s...) para dejar respirar a la SUNAT
+                    time.sleep(2 * intento) 
             except Exception:
                 time.sleep(2 * intento)
 
         if mejor_tabla is not None:
             todas_las_tablas.append(mejor_tabla)
             
-        # Feedback detallado: Si ves que sufre en alguna página, el bot te lo dirá
         texto_progreso.write(f"📥 Descargando página {pagina}/{total_paginas} | Rescatados: {mejor_duas}/{esperadas}")
         barra_progreso.progress(pagina / total_paginas)
-        
-        # Pausa obligatoria de 0.5s para no detonar el firewall del Estado
         time.sleep(0.5)
 
     texto_progreso.empty()
@@ -135,7 +137,9 @@ def descargar_exportaciones_mes(fecha_inicio, fecha_fin, ruc):
         df_final['FOB'] = df_final['FOB'].astype(str).str.replace(',', '', regex=False).str.strip()
         df_final['FOB'] = pd.to_numeric(df_final['FOB'], errors='coerce')
 
+    # Eliminamos las filas repetidas por haber capturado la página 1 dos veces
     df_final = df_final.drop_duplicates(ignore_index=True)
+    
     return df_final, total_registros
 
 ruc_input = st.text_input("RUC de la empresa:", value="20451899881")
