@@ -39,7 +39,6 @@ def _extraer_mejor_tabla(html):
 
 @st.cache_data(show_spinner=False)
 def descargar_exportaciones_mes(fecha_inicio, fecha_fin, ruc):
-    """Descarga todo el mes usando 1 sola sesión de Selenium y paginación rápida con Requests."""
     opciones = Options()
     opciones.add_argument("--headless")
     opciones.add_argument("--no-sandbox")
@@ -59,7 +58,7 @@ def descargar_exportaciones_mes(fecha_inicio, fecha_fin, ruc):
         html_inicial = driver.page_source
         cookies_selenium = driver.get_cookies()
     finally:
-        driver.quit() # Cerramos Selenium rápido para ahorrar memoria
+        driver.quit() 
 
     match_total = re.search(r"a\s+\d+\s+de\s+(\d+)", html_inicial)
     if not match_total:
@@ -68,7 +67,6 @@ def descargar_exportaciones_mes(fecha_inicio, fecha_fin, ruc):
     total_registros = int(match_total.group(1))
     total_paginas = math.ceil(total_registros / 20)
 
-    # Iniciamos la sesión rápida con requests
     sesion = requests.Session()
     for cookie in cookies_selenium:
         sesion.cookies.set(cookie['name'], cookie['value'])
@@ -77,20 +75,19 @@ def descargar_exportaciones_mes(fecha_inicio, fecha_fin, ruc):
     url_paginacion = "http://www.aduanet.gob.pe/cl-ad-consdespade/FrmPolizaporDetalle.jsp"
     todas_las_tablas = []
 
-    # UI Visuales para el progreso del mes
     texto_progreso = st.empty()
     barra_progreso = st.progress(0)
 
-    # Bucle rápido página por página (Sin reiniciar el navegador)
+    # --- BUCLE BLINDADO (Modo Tanque) ---
     for pagina in range(1, total_paginas + 1):
         esperadas = 20 if pagina < total_paginas else total_registros - 20 * (total_paginas - 1)
         mejor_tabla = None
         mejor_duas = -1
 
-        # Reintento robusto SÓLO para la página actual si la conexión falla
-        for intento in range(1, 4):
+        # Hasta 5 intentos agresivos si la página de la SUNAT se niega a cargar
+        for intento in range(1, 6):
             try:
-                resp_pag = sesion.post(url_paginacion, data={"tamanioPagina": "20", "pagina": str(pagina)}, timeout=15)
+                resp_pag = sesion.post(url_paginacion, data={"tamanioPagina": "20", "pagina": str(pagina)}, timeout=20)
                 resp_pag.encoding = "ISO-8859-1"
                 t = _extraer_mejor_tabla(resp_pag.text)
                 duas = _contar_duas(t)
@@ -100,17 +97,21 @@ def descargar_exportaciones_mes(fecha_inicio, fecha_fin, ruc):
                     mejor_tabla = t
                     
                 if duas >= esperadas:
-                    break # Lectura perfecta, pasamos a la siguiente página rápido
+                    break # Salimos del reintento, la página vino completa
+                else:
+                    time.sleep(2 * intento) # Castigo de tiempo progresivo (2s, 4s, 6s...) para dejar respirar a la SUNAT
             except Exception:
-                pass
-            time.sleep(1) # Pequeña pausa si falla antes del siguiente intento
+                time.sleep(2 * intento)
 
         if mejor_tabla is not None:
             todas_las_tablas.append(mejor_tabla)
             
-        # Actualizamos la interfaz para que veas que está avanzando
-        texto_progreso.write(f"📥 Descargando página {pagina} de {total_paginas}...")
+        # Feedback detallado: Si ves que sufre en alguna página, el bot te lo dirá
+        texto_progreso.write(f"📥 Descargando página {pagina}/{total_paginas} | Rescatados: {mejor_duas}/{esperadas}")
         barra_progreso.progress(pagina / total_paginas)
+        
+        # Pausa obligatoria de 0.5s para no detonar el firewall del Estado
+        time.sleep(0.5)
 
     texto_progreso.empty()
     barra_progreso.empty()
@@ -118,7 +119,6 @@ def descargar_exportaciones_mes(fecha_inicio, fecha_fin, ruc):
     if not todas_las_tablas:
         return pd.DataFrame(), total_registros
 
-    # --- LIMPIEZA FINAL ---
     df_final = pd.concat(todas_las_tablas, ignore_index=True)
     df_final[0] = df_final[0].replace([None, 'nan', 'NaN', ''], pd.NA).ffill()
     df_final[1] = df_final[1].replace([None, 'nan', 'NaN', ''], pd.NA).ffill()
@@ -141,7 +141,7 @@ def descargar_exportaciones_mes(fecha_inicio, fecha_fin, ruc):
 ruc_input = st.text_input("RUC de la empresa:", value="20451899881")
 col1, col2 = st.columns(2)
 with col1: fecha_input_inicio = st.text_input("Fecha Inicio (DDMMAAAA):", value="01012026")
-with col2: fecha_input_fin = st.text_input("Fecha Fin (DDMMAAAA):", value="30092026")
+with col2: fecha_input_fin = st.text_input("Fecha Fin (DDMMAAAA):", value="31072026")
 
 if st.button("🚀 Extraer Datos", type="primary"):
     try:
