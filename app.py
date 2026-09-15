@@ -1,16 +1,13 @@
 import streamlit as st
 import pandas as pd
-import math
 import re
-from io import BytesIO, StringIO
+from io import StringIO, BytesIO
 import time
-from datetime import datetime, timedelta
+from datetime import datetime
 import calendar
 from selenium import webdriver
 from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.chrome.options import Options
-from webdriver_manager.chrome import ChromeDriverManager
-import requests
 
 st.set_page_config(page_title="Extractor Sunat - Prolan", page_icon="📊", layout="centered")
 st.title("📊 Extractor Automático de Exportaciones")
@@ -27,6 +24,7 @@ def _extraer_mejor_tabla(html):
     except ValueError:
         return None
     best_t, max_duas = None, -1
+    # Escaneamos el HTML buscando la tabla real de exportaciones
     for t in tablas:
         if t.shape[1] >= 15:
             duas = _contar_duas(t)
@@ -38,8 +36,8 @@ def _extraer_mejor_tabla(html):
     return best_t
 
 @st.cache_data(show_spinner=False)
-def descargar_bloque_fechas(fecha_inicio, fecha_fin, ruc):
-    """Descarga un bloque pequeño de fechas sin saturar la memoria de Aduanet"""
+def extraer_datos_aduanet_vista_unica(fecha_inicio, fecha_fin, ruc):
+    """Extrae todos los datos asumiendo que Aduanet los renderiza en una sola vista sin paginación."""
     opciones = Options()
     opciones.add_argument("--headless")
     opciones.add_argument("--no-sandbox")
@@ -55,81 +53,46 @@ def descargar_bloque_fechas(fecha_inicio, fecha_fin, ruc):
     
     try:
         driver.get(url_busqueda)
-        time.sleep(3)
-        html_inicial = driver.page_source
-        cookies_selenium = driver.get_cookies()
+        # Damos 5 segundos para que la tabla gigante (ej. Julio con 1389 filas) cargue por completo
+        time.sleep(5) 
+        html_final = driver.page_source
     finally:
         driver.quit() 
 
-    match_total = re.search(r"a\s+\d+\s+de\s+(\d+)", html_inicial)
-    if not match_total:
-        return pd.DataFrame(), 0
-        
-    total_registros = int(match_total.group(1))
-    total_paginas = math.ceil(total_registros / 20)
+    # Buscamos cuántos registros dice la web que hay en total
+    match_total = re.search(r"a\s+\d+\s+de\s+(\d+)", html_final)
+    total_esperado = int(match_total.group(1)) if match_total else 0
 
-    todas_las_tablas = []
+    # Extraemos la tabla directamente de esta vista única
+    df_crudo = _extraer_mejor_tabla(html_final)
     
-    # Rescatamos la Página 1
-    tabla_inicial = _extraer_mejor_tabla(html_inicial)
-    if tabla_inicial is not None and _contar_duas(tabla_inicial) > 0:
-        todas_las_tablas.append(tabla_inicial)
+    if df_crudo is None or df_crudo.empty:
+        return pd.DataFrame(), total_esperado
 
-    sesion = requests.Session()
-    for cookie in cookies_selenium:
-        sesion.cookies.set(cookie['name'], cookie['value'])
-    sesion.headers.update({"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)", "Referer": url_busqueda})
+    # --- LIMPIEZA MAESTRA ---
+    # 1. Rellenamos las celdas combinadas (DUA y EXPORTADOR) hacia abajo para salvar los registros múltiples
+    df_crudo[0] = df_crudo[0].replace([None, 'nan', 'NaN', ''], pd.NA).ffill()
+    df_crudo[1] = df_crudo[1].replace([None, 'nan', 'NaN', ''], pd.NA).ffill()
 
-    url_paginacion = "http://www.aduanet.gob.pe/cl-ad-consdespade/FrmPolizaporDetalle.jsp"
+    # 2. Conservamos SOLO las filas donde el ítem (SERIE) sea un número real
+    if df_crudo.shape[1] >= 12:
+        mask_serie = pd.to_numeric(df_crudo[11], errors='coerce').notna()
+        df_final = df_crudo[mask_serie].reset_index(drop=True)
+    else:
+        df_final = df_crudo
 
-    for pagina in range(1, total_paginas + 1):
-        esperadas = 20 if pagina < total_paginas else total_registros - 20 * (total_paginas - 1)
-        mejor_tabla = None
-        mejor_duas = -1
-
-        for intento in range(1, 4):
-            try:
-                resp_pag = sesion.post(url_paginacion, data={"tamanioPagina": "20", "pagina": str(pagina)}, timeout=15)
-                resp_pag.encoding = "ISO-8859-1"
-                t = _extraer_mejor_tabla(resp_pag.text)
-                duas = _contar_duas(t)
-                
-                if duas > mejor_duas:
-                    mejor_duas = duas
-                    mejor_tabla = t
-                    
-                if duas >= esperadas:
-                    break 
-            except Exception:
-                pass
-            time.sleep(1)
-
-        if mejor_tabla is not None:
-            todas_las_tablas.append(mejor_tabla)
-            
-        time.sleep(0.5)
-
-    if not todas_las_tablas:
-        return pd.DataFrame(), total_registros
-
-    df_final = pd.concat(todas_las_tablas, ignore_index=True)
-    df_final[0] = df_final[0].replace([None, 'nan', 'NaN', ''], pd.NA).ffill()
-    df_final[1] = df_final[1].replace([None, 'nan', 'NaN', ''], pd.NA).ffill()
-
-    if df_final.shape[1] >= 12:
-        mask_serie = pd.to_numeric(df_final[11], errors='coerce').notna()
-        df_final = df_final[mask_serie].reset_index(drop=True)
-
+    # 3. Formateamos las 22 columnas exactas
     cols = ['DESCLARACION', 'EXPORTADOR', 'FEC.NUM', 'AGENTE', "CANT SERIE'S", 'FOB TOT.', 'ALMACEN', 'AFORO', 'NETO TOT', '# BULTOS', 'PAIS DEST', 'SERIE', 'PARTIDA', 'DESC. COMER', 'DESC. PREST', 'DESC. MAT. CONST', 'DES. USO', 'DESC. OTROS', 'CANT', 'UNID.', 'PESO NETO', 'FOB']
     df_final = df_final.iloc[:, :22]
     df_final.columns = cols[:len(df_final.columns)]
 
+    # 4. Forzamos la columna FOB a número decimal para tus reportes
     if 'FOB' in df_final.columns:
         df_final['FOB'] = df_final['FOB'].astype(str).str.replace(',', '', regex=False).str.strip()
         df_final['FOB'] = pd.to_numeric(df_final['FOB'], errors='coerce')
+        
+    return df_final, total_esperado
 
-    df_final = df_final.drop_duplicates(ignore_index=True)
-    return df_final, total_registros
 
 ruc_input = st.text_input("RUC de la empresa:", value="20451899881")
 col1, col2 = st.columns(2)
@@ -142,32 +105,28 @@ if st.button("🚀 Extraer Datos", type="primary"):
         dt_fin = datetime.strptime(fecha_input_fin.strip(), "%d%m%Y")
 
         df_acumulado = pd.DataFrame()
-        
-        # --- GENERADOR DE MICRO-BATCHES (10 DÍAS) ---
-        intervalos = []
-        fecha_actual = dt_inicio
-        while fecha_actual <= dt_fin:
-            fecha_siguiente = fecha_actual + timedelta(days=9)
-            if fecha_siguiente > dt_fin:
-                fecha_siguiente = dt_fin
-            intervalos.append((fecha_actual.strftime("%d/%m/%Y"), fecha_siguiente.strftime("%d/%m/%Y")))
-            fecha_actual = fecha_siguiente + timedelta(days=1)
+        rango_meses = pd.date_range(start=dt_inicio.replace(day=1), end=dt_fin, freq='MS')
 
         with st.status("Procesando datos en Aduanet...", expanded=True) as status:
-            progreso_text = st.empty()
-            
-            for idx, (f_ini, f_fin) in enumerate(intervalos):
-                progreso_text.write(f"📅 Extrayendo bloque {idx + 1} de {len(intervalos)}: {f_ini} al {f_fin}")
+            for mes_dt in rango_meses:
+                año_actual, mes_actual = mes_dt.year, mes_dt.month
+                dia_inicio = dt_inicio.day if (año_actual == dt_inicio.year and mes_actual == dt_inicio.month) else 1
+                dia_fin = dt_fin.day if (año_actual == dt_fin.year and mes_actual == dt_fin.month) else calendar.monthrange(año_actual, mes_actual)[1]
+
+                f_inicio = f"{dia_inicio:02d}/{mes_actual:02d}/{año_actual}"
+                f_fin = f"{dia_fin:02d}/{mes_actual:02d}/{año_actual}"
+
+                st.write(f"📅 Consultando mes: {f_inicio} al {f_fin}")
                 
-                df_bloque, total_esperado = descargar_bloque_fechas(f_ini, f_fin, ruc_input)
+                # Ya no necesitamos partir fechas ni hacer bucles de páginas
+                df_mes, total_esperado = extraer_datos_aduanet_vista_unica(f_inicio, f_fin, ruc_input)
                 
-                estado = "✅" if len(df_bloque) >= (total_esperado * 0.98) else "❗"
-                st.write(f"&nbsp;&nbsp;&nbsp;{estado} Bloque {f_ini}-{f_fin}: Obtenidos {len(df_bloque)} de {total_esperado}")
+                estado = "✅" if len(df_mes) == total_esperado else "❗"
+                st.write(f"&nbsp;&nbsp;&nbsp;{estado} Obtenidos {len(df_mes)} de {total_esperado} registros reportados por SUNAT")
                 
-                if not df_bloque.empty: 
-                    df_acumulado = pd.concat([df_acumulado, df_bloque], ignore_index=True)
+                if not df_mes.empty: 
+                    df_acumulado = pd.concat([df_acumulado, df_mes], ignore_index=True)
                     
-            progreso_text.empty()
             status.update(label="¡Extracción completada!", state="complete")
 
         if not df_acumulado.empty:
@@ -176,6 +135,6 @@ if st.button("🚀 Extraer Datos", type="primary"):
             df_acumulado.to_excel(buffer, index=False, engine='openpyxl')
             st.download_button(label="📥 Descargar Excel", data=buffer.getvalue(), file_name=f"Exportaciones_{fecha_input_inicio}_al_{fecha_input_fin}.xlsx", mime="application/vnd.ms-excel")
         else:
-            st.warning("No se encontraron datos en el rango seleccionado.")
+            st.warning("No se encontraron datos.")
     except ValueError:
         st.error("Formato de fecha incorrecto. Usa DDMMAAAA.")
