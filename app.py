@@ -54,7 +54,7 @@ def descargar_exportaciones_mes(fecha_inicio, fecha_fin, ruc):
     
     try:
         driver.get(url_busqueda)
-        time.sleep(5)  # Damos 5 segundos reales para que la página 1 cargue al 100%
+        time.sleep(4) 
         html_inicial = driver.page_source
         cookies_selenium = driver.get_cookies()
     finally:
@@ -67,26 +67,19 @@ def descargar_exportaciones_mes(fecha_inicio, fecha_fin, ruc):
     total_registros = int(match_total.group(1))
     total_paginas = math.ceil(total_registros / 20)
 
-    todas_las_tablas = []
-    
-    # 1. CAPTURAMOS LA PÁGINA 1
-    tabla_inicial = _extraer_mejor_tabla(html_inicial)
-    if tabla_inicial is not None and _contar_duas(tabla_inicial) > 0:
-        todas_las_tablas.append(tabla_inicial)
-
-    # 2. INICIAMOS SESIÓN RÁPIDA PARA EL RESTO DE PÁGINAS
     sesion = requests.Session()
     for cookie in cookies_selenium:
         sesion.cookies.set(cookie['name'], cookie['value'])
     sesion.headers.update({"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)", "Referer": url_busqueda})
 
     url_paginacion = "http://www.aduanet.gob.pe/cl-ad-consdespade/FrmPolizaporDetalle.jsp"
-
+    todas_las_tablas = []
+    
     texto_progreso = st.empty()
     barra_progreso = st.progress(0)
 
-    # 3. BUCLE BLINDADO PARA PÁGINAS 2 a N (Ideal para volúmenes altos como Julio)
-    for pagina in range(2, total_paginas + 1):
+    # --- LA CORRECCIÓN: BUCLE DESDE LA PÁGINA 1 ---
+    for pagina in range(1, total_paginas + 1):
         esperadas = 20 if pagina < total_paginas else total_registros - 20 * (total_paginas - 1)
         mejor_tabla = None
         mejor_duas = -1
@@ -141,9 +134,7 @@ def descargar_exportaciones_mes(fecha_inicio, fecha_fin, ruc):
         df_final['FOB'] = df_final['FOB'].astype(str).str.replace(',', '', regex=False).str.strip()
         df_final['FOB'] = pd.to_numeric(df_final['FOB'], errors='coerce')
 
-    # Eliminamos las filas clones si por culpa del HTML se pegó una misma tabla dos veces
-    df_final = df_final.drop_duplicates(ignore_index=True)
-    
+    # ELIMINAMOS el drop_duplicates para no perder registros legítimos con datos gemelos
     return df_final, total_registros
 
 
