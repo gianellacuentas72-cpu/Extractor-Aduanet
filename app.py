@@ -4,7 +4,7 @@ import math
 import re
 from io import BytesIO, StringIO
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 import calendar
 from selenium import webdriver
 from selenium.webdriver.chrome.service import Service
@@ -38,7 +38,8 @@ def _extraer_mejor_tabla(html):
     return best_t
 
 @st.cache_data(show_spinner=False)
-def descargar_exportaciones_mes(fecha_inicio, fecha_fin, ruc):
+def descargar_bloque_fechas(fecha_inicio, fecha_fin, ruc):
+    """Descarga un bloque pequeño de fechas sin saturar la memoria de Aduanet"""
     opciones = Options()
     opciones.add_argument("--headless")
     opciones.add_argument("--no-sandbox")
@@ -69,7 +70,7 @@ def descargar_exportaciones_mes(fecha_inicio, fecha_fin, ruc):
 
     todas_las_tablas = []
     
-    # --- EL SALVAVIDAS: Rescatamos la Página 1 que Selenium ya vio ---
+    # Rescatamos la Página 1
     tabla_inicial = _extraer_mejor_tabla(html_inicial)
     if tabla_inicial is not None and _contar_duas(tabla_inicial) > 0:
         todas_las_tablas.append(tabla_inicial)
@@ -81,18 +82,14 @@ def descargar_exportaciones_mes(fecha_inicio, fecha_fin, ruc):
 
     url_paginacion = "http://www.aduanet.gob.pe/cl-ad-consdespade/FrmPolizaporDetalle.jsp"
 
-    texto_progreso = st.empty()
-    barra_progreso = st.progress(0)
-
-    # --- BUCLE BLINDADO (Descargamos todo por Requests) ---
     for pagina in range(1, total_paginas + 1):
         esperadas = 20 if pagina < total_paginas else total_registros - 20 * (total_paginas - 1)
         mejor_tabla = None
         mejor_duas = -1
 
-        for intento in range(1, 6):
+        for intento in range(1, 4):
             try:
-                resp_pag = sesion.post(url_paginacion, data={"tamanioPagina": "20", "pagina": str(pagina)}, timeout=20)
+                resp_pag = sesion.post(url_paginacion, data={"tamanioPagina": "20", "pagina": str(pagina)}, timeout=15)
                 resp_pag.encoding = "ISO-8859-1"
                 t = _extraer_mejor_tabla(resp_pag.text)
                 duas = _contar_duas(t)
@@ -103,20 +100,14 @@ def descargar_exportaciones_mes(fecha_inicio, fecha_fin, ruc):
                     
                 if duas >= esperadas:
                     break 
-                else:
-                    time.sleep(2 * intento) 
             except Exception:
-                time.sleep(2 * intento)
+                pass
+            time.sleep(1)
 
         if mejor_tabla is not None:
             todas_las_tablas.append(mejor_tabla)
             
-        texto_progreso.write(f"📥 Descargando página {pagina}/{total_paginas} | Rescatados: {mejor_duas}/{esperadas}")
-        barra_progreso.progress(pagina / total_paginas)
         time.sleep(0.5)
-
-    texto_progreso.empty()
-    barra_progreso.empty()
 
     if not todas_las_tablas:
         return pd.DataFrame(), total_registros
@@ -137,9 +128,7 @@ def descargar_exportaciones_mes(fecha_inicio, fecha_fin, ruc):
         df_final['FOB'] = df_final['FOB'].astype(str).str.replace(',', '', regex=False).str.strip()
         df_final['FOB'] = pd.to_numeric(df_final['FOB'], errors='coerce')
 
-    # Eliminamos las filas repetidas por haber capturado la página 1 dos veces
     df_final = df_final.drop_duplicates(ignore_index=True)
-    
     return df_final, total_registros
 
 ruc_input = st.text_input("RUC de la empresa:", value="20451899881")
@@ -153,34 +142,40 @@ if st.button("🚀 Extraer Datos", type="primary"):
         dt_fin = datetime.strptime(fecha_input_fin.strip(), "%d%m%Y")
 
         df_acumulado = pd.DataFrame()
-        rango_meses = pd.date_range(start=dt_inicio.replace(day=1), end=dt_fin, freq='MS')
+        
+        # --- GENERADOR DE MICRO-BATCHES (10 DÍAS) ---
+        intervalos = []
+        fecha_actual = dt_inicio
+        while fecha_actual <= dt_fin:
+            fecha_siguiente = fecha_actual + timedelta(days=9)
+            if fecha_siguiente > dt_fin:
+                fecha_siguiente = dt_fin
+            intervalos.append((fecha_actual.strftime("%d/%m/%Y"), fecha_siguiente.strftime("%d/%m/%Y")))
+            fecha_actual = fecha_siguiente + timedelta(days=1)
 
         with st.status("Procesando datos en Aduanet...", expanded=True) as status:
-            for mes_dt in rango_meses:
-                año_actual, mes_actual = mes_dt.year, mes_dt.month
-                dia_inicio = dt_inicio.day if (año_actual == dt_inicio.year and mes_actual == dt_inicio.month) else 1
-                dia_fin = dt_fin.day if (año_actual == dt_fin.year and mes_actual == dt_fin.month) else calendar.monthrange(año_actual, mes_actual)[1]
-
-                f_inicio = f"{dia_inicio:02d}/{mes_actual:02d}/{año_actual}"
-                f_fin = f"{dia_fin:02d}/{mes_actual:02d}/{año_actual}"
-
-                st.write(f"📅 Consultando mes: {f_inicio} al {f_fin}")
-                df_mes, total_esperado = descargar_exportaciones_mes(f_inicio, f_fin, ruc_input)
+            progreso_text = st.empty()
+            
+            for idx, (f_ini, f_fin) in enumerate(intervalos):
+                progreso_text.write(f"📅 Extrayendo bloque {idx + 1} de {len(intervalos)}: {f_ini} al {f_fin}")
                 
-                estado = "✅" if len(df_mes) >= (total_esperado * 0.98) else "❗"
-                st.write(f"&nbsp;&nbsp;&nbsp;{estado} Obtenidos {len(df_mes)} de {total_esperado} registros")
+                df_bloque, total_esperado = descargar_bloque_fechas(f_ini, f_fin, ruc_input)
                 
-                if not df_mes.empty: 
-                    df_acumulado = pd.concat([df_acumulado, df_mes], ignore_index=True)
+                estado = "✅" if len(df_bloque) >= (total_esperado * 0.98) else "❗"
+                st.write(f"&nbsp;&nbsp;&nbsp;{estado} Bloque {f_ini}-{f_fin}: Obtenidos {len(df_bloque)} de {total_esperado}")
+                
+                if not df_bloque.empty: 
+                    df_acumulado = pd.concat([df_acumulado, df_bloque], ignore_index=True)
                     
+            progreso_text.empty()
             status.update(label="¡Extracción completada!", state="complete")
 
         if not df_acumulado.empty:
-            st.success(f"✅ Se consolidaron {len(df_acumulado)} registros totales.")
+            st.success(f"✅ Se consolidaron {len(df_acumulado)} registros en total.")
             buffer = BytesIO()
             df_acumulado.to_excel(buffer, index=False, engine='openpyxl')
             st.download_button(label="📥 Descargar Excel", data=buffer.getvalue(), file_name=f"Exportaciones_{fecha_input_inicio}_al_{fecha_input_fin}.xlsx", mime="application/vnd.ms-excel")
         else:
-            st.warning("No se encontraron datos.")
+            st.warning("No se encontraron datos en el rango seleccionado.")
     except ValueError:
         st.error("Formato de fecha incorrecto. Usa DDMMAAAA.")
